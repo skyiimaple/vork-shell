@@ -1,0 +1,11 @@
+allowBuilds:
+  electron: true
+  esbuild: true
+  cpu-features: false
+  ssh2: false
+  vue-demi: true
+  electron-winstaller: false
+minimumReleaseAgeExclude:
+  - '@tanstack/table-core@9.2.6'
+  - '@tanstack/vue-table@9.2.6'
+  - reka-ui@2.11.0

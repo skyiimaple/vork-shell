@@ -1,0 +1,16 @@
+name: Vork Shell
+description: Unified workspace for SSH terminals and SQLite, MySQL, PostgreSQL, and Redis databases.
+website: https://github.com/skyiimaple/vork-shell
+repository: https://github.com/skyiimaple/vork-shell
+category: Developer Tools
+license: MIT
+keywords:
+  - ssh
+  - terminal
+  - database
+  - sqlite
+  - mysql
+  - postgresql
+  - redis
+locales:
+  - zh-CN

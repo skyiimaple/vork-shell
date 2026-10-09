@@ -1,0 +1,48 @@
+name: Build release candidate
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: mac
+          - os: windows-latest
+            target: win
+          - os: ubuntu-latest
+            target: linux
+    runs-on: ${{ matrix.os }}
+    env:
+      VORK_ENABLE_UPDATES: '1'
+      CSC_LINK: ${{ matrix.target == 'win' && secrets.WINDOWS_CSC_LINK || matrix.target == 'mac' && secrets.MAC_CSC_LINK || '' }}
+      CSC_KEY_PASSWORD: ${{ matrix.target == 'win' && secrets.WINDOWS_CSC_KEY_PASSWORD || matrix.target == 'mac' && secrets.MAC_CSC_KEY_PASSWORD || '' }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm release:preflight
+      - run: pnpm check
+      - run: pnpm exec electron-builder --config electron-builder.cjs --${{ matrix.target }} --publish never
+        if: ${{ success() }}
+      - uses: actions/upload-artifact@v7.0.2
+        with:
+          name: vork-${{ matrix.target }}
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/*.exe
+            release/*.AppImage
+            release/*.yml
+            release/*.blockmap
+            CHANGELOG.md
+            public/changelog.html
