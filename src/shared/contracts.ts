@@ -130,9 +130,12 @@ export interface DesktopApi {
   ): Promise<string | null>
   queryPlan(id: string, sql: string): Promise<QueryPlan>
   aiSettings(): Promise<AiSettingsView>
-  saveAiSettings(config: AiSettings & { apiKey?: string }): Promise<AiSettingsView>
+  saveAiSettings(
+    config: AiSettings & { apiKey?: string; proxyUsername?: string; proxyPassword?: string },
+  ): Promise<AiSettingsView>
   aiComplete(sessionId: string, request: AiRequest): Promise<AiResponse>
   aiCancel(requestId: string): Promise<boolean>
+  onAiProgress(callback: (progress: AiProgress) => void): () => void
   onWindowState(callback: (state: { fullscreen: boolean; platform: string }) => void): () => void
   createQuerySession(id: string, database?: string): Promise<Session>
   setConnectionColor(id: string, color: string): Promise<void>
@@ -525,9 +528,16 @@ export interface AiSettings {
   baseUrl: string
   model: string
   maxTokens?: number
+  proxyUrl?: string
 }
 export interface AiSettingsView extends AiSettings {
   hasApiKey: boolean
+  proxyUsername: string
+  hasProxyPassword: boolean
+}
+export interface AiProgress {
+  id: string
+  text: string
 }
 export interface AiRequest {
   id: string

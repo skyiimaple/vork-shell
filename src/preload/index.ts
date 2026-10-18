@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { DesktopApi, Reply, SessionEvent, StructureProgress } from '../shared/contracts'
+import type {
+  AiProgress,
+  DesktopApi,
+  Reply,
+  SessionEvent,
+  StructureProgress,
+} from '../shared/contracts'
 
 async function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
   const result: Reply<T> = await ipcRenderer.invoke(channel, ...args)
@@ -24,6 +30,11 @@ const api: DesktopApi = {
   saveAiSettings: (config) => invoke('vork:ai-save-settings', config),
   aiComplete: (id, request) => invoke('vork:ai-complete', id, request),
   aiCancel: (id) => invoke('vork:ai-cancel', id),
+  onAiProgress(callback) {
+    const listener = (_: Electron.IpcRendererEvent, value: AiProgress) => callback(value)
+    ipcRenderer.on('vork:ai-progress', listener)
+    return () => ipcRenderer.removeListener('vork:ai-progress', listener)
+  },
   onWindowState(callback) {
     const listener = (
       _: Electron.IpcRendererEvent,

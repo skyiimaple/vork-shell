@@ -25,6 +25,11 @@ const provider = ref<AiSettings['provider']>('openai-compatible'),
   apiKey = ref(''),
   hasKey = ref(false),
   clearKey = ref(false),
+  proxyUrl = ref(''),
+  proxyUsername = ref(''),
+  proxyPassword = ref(''),
+  hasProxyPassword = ref(false),
+  clearProxyPassword = ref(false),
   busy = ref(false),
   loaded = ref(false),
   error = ref(''),
@@ -48,6 +53,9 @@ async function load() {
     model.value = settings.model
     maxTokens.value = settings.maxTokens || 4096
     hasKey.value = settings.hasApiKey
+    proxyUrl.value = settings.proxyUrl || ''
+    proxyUsername.value = settings.proxyUsername || ''
+    hasProxyPassword.value = settings.hasProxyPassword
     loaded.value = true
     emit('loaded', settings)
   } catch (e) {
@@ -67,11 +75,23 @@ async function save() {
       baseUrl: baseUrl.value,
       model: model.value,
       maxTokens: Number(maxTokens.value),
+      proxyUrl: proxyUrl.value,
+      proxyUsername: proxyUsername.value,
       ...(clearKey.value ? { apiKey: '' } : apiKey.value ? { apiKey: apiKey.value } : {}),
+      ...(clearProxyPassword.value
+        ? { proxyPassword: '' }
+        : proxyPassword.value
+          ? { proxyPassword: proxyPassword.value }
+          : {}),
     })
     hasKey.value = settings.hasApiKey
     apiKey.value = ''
     clearKey.value = false
+    proxyUrl.value = settings.proxyUrl || ''
+    proxyUsername.value = settings.proxyUsername || ''
+    proxyPassword.value = ''
+    hasProxyPassword.value = settings.hasProxyPassword
+    clearProxyPassword.value = false
     notice.value = 'AI 配置已保存'
     emit('saved', settings)
   } catch (e) {
@@ -138,9 +158,42 @@ onMounted(load)
     <Label v-if="hasKey" class="flex items-center gap-2 text-sm"
       ><checkbox v-model="clearKey" :disabled="busy || disabled" />清除已保存的 Key</Label
     >
+    <Label class="grid gap-2"
+      ><span>HTTP(S) 代理（可选，仅用于连接 AI 服务）</span
+      ><Input
+        v-model="proxyUrl"
+        aria-label="AI 代理地址"
+        placeholder="http://127.0.0.1:7890"
+        :disabled="busy || disabled"
+    /></Label>
+    <div class="grid gap-3 sm:grid-cols-2">
+      <Label class="grid gap-2"
+        ><span>代理用户名（可选）</span
+        ><Input
+          v-model="proxyUsername"
+          aria-label="AI 代理用户名"
+          autocomplete="off"
+          :disabled="busy || disabled" /></Label
+      ><Label class="grid gap-2"
+        ><span>代理密码 {{ hasProxyPassword ? '（已保存，留空保留）' : '（无认证可留空）' }}</span
+        ><Input
+          v-model="proxyPassword"
+          aria-label="AI 代理密码"
+          type="password"
+          autocomplete="new-password"
+          :disabled="busy || disabled || clearProxyPassword"
+      /></Label>
+    </div>
+    <Label v-if="hasProxyPassword" class="flex items-center gap-2 text-sm"
+      ><checkbox
+        v-model="clearProxyPassword"
+        :disabled="busy || disabled"
+      />清除已保存的代理密码</Label
+    >
     <p class="text-muted-foreground text-xs">
-      Key 由系统加密保存，不回传界面。更换服务类型或服务域名时，留空会清除旧
-      Key。请求仅在主动发送时发生。
+      Key 与代理密码由系统加密保存，不回传界面。更换服务类型或服务域名时，留空会清除旧
+      Key。更换代理主机或端口且留空密码时，不保留旧密码。请求仅在主动发送时发生，默认流式输出；服务若返回完整
+      JSON 仍可使用。
     </p>
     <alert v-if="error" variant="destructive"
       ><alert-description>{{ error }}</alert-description></alert

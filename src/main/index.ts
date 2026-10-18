@@ -334,7 +334,10 @@ function registerIpc() {
   handle('vork:ai-settings', () => aiSettings.settings())
   handle('vork:ai-save-settings', (_, config) => aiSettings.save(config))
   handle('vork:ai-complete', (owner, id, request) =>
-    ai.complete(owner, sessions.getSession(owner, id).type, request),
+    ai.complete(owner, sessions.getSession(owner, id).type, request, (progress) => {
+      if (window && !window.isDestroyed() && window.webContents.id === owner)
+        window.webContents.send('vork:ai-progress', progress)
+    }),
   )
   handle('vork:ai-cancel', (owner, id) => ai.cancel(owner, id))
   handle('vork:activity-logs', async () => ({
