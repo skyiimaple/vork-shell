@@ -5,7 +5,7 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from '@/components/ui/dropdown-menu'
-import { Bookmark, WandSparkles, PanelsTopLeft } from '@lucide/vue'
+import { Bookmark, WandSparkles, PanelsTopLeft, Sparkles, GitBranch } from '@lucide/vue'
 import { ResizeHandle } from '@/components/ui/resize-handle'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { notifications } from '@/composables/use-notifications'
@@ -13,6 +13,32 @@ import { formatSql } from '@/lib/sql-format'
 import CodeEditor from './code-editor.vue'
 import SqlSnippets from './sql-snippets.vue'
 import DataBrowser from './data-browser.vue'
+import SchemaBrowser from './schema-browser.vue'
+import AiSqlAssistant from './ai-sql-assistant.vue'
+import QueryPlanDialog from './query-plan-dialog.vue'
+const planOpen = ref(false)
+const aiOpen = ref(false),
+  aiDraft = ref(false),
+  aiReview = ref(false),
+  aiSql = ref('')
+function applyAi(sql: string) {
+  command.value = sql
+  selection.value = ''
+  aiDraft.value = true
+}
+function confirmAi() {
+  if (props.closed || metadataBusy.value || mutation.isPending.value) return
+  aiReview.value = false
+  aiDraft.value = false
+  error.value = ''
+  mutation.mutate(aiSql.value)
+}
+const schemaOpen = ref(false),
+  schemaObject = ref<SqlObject>()
+function browseSchema(object: SqlObject) {
+  schemaObject.value = { ...object }
+  schemaOpen.value = true
+}
 import type { SqlObject } from '@/lib/sql-browser'
 const dataOpen = ref(false),
   dataObject = ref<SqlObject>()
@@ -33,6 +59,21 @@ import {
   SelectItem,
 } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from '@/components/ui/dialog'
+const insertOpen = ref(false),
+  insertTable = ref(''),
+  insertAction = ref<'export' | 'copy'>('export')
+function openInsert(action: 'export' | 'copy') {
+  insertAction.value = action
+  insertOpen.value = true
+}
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import ResultTable from './result-table.vue'
@@ -186,6 +227,11 @@ function run(sql?: unknown) {
         ? selection.value
         : command.value
   if (props.closed || metadataBusy.value || mutation.isPending.value || !chosen.trim()) return
+  if (aiDraft.value) {
+    aiSql.value = chosen
+    aiReview.value = true
+    return
+  }
   error.value = ''
   mutation.mutate(chosen)
 }
@@ -196,11 +242,21 @@ async function cancel() {
     error.value = (e as Error).message
   }
 }
-async function exportRows() {
+async function exportRows(format: 'csv' | 'json' | 'markdown' | 'sql' | 'xlsx' = 'csv') {
   if (!result.value || exporting.value || props.closed) return
   exporting.value = true
   try {
-    const path = await window.vork.exportResult(props.session.id, result.value)
+    const path = await window.vork.exportResult(
+      props.session.id,
+      {
+        ...result.value,
+        columns: [...result.value.columns],
+        rows: result.value.rows.map((row) => [...row]),
+      },
+      format,
+      format === 'sql' ? insertTable.value : undefined,
+    )
+    if (path) insertOpen.value = false
     if (path && mounted)
       exportNotice.value = `已导出当前结果：${path}${result.value.truncated ? '（仅当前截断结果）' : ''}`
   } catch (e) {
@@ -216,21 +272,32 @@ function restoreHistory(value: unknown) {
     historySelection.value = item.id
   }
 }
-async function copy() {
-  if (!result.value) return
+async function copy(format: 'tsv' | 'csv' | 'json' | 'markdown' | 'sql' = 'tsv') {
+  if (!result.value || exporting.value || props.closed) return
+  exporting.value = true
   try {
-    await navigator.clipboard.writeText(
-      [
-        result.value.columns.join('\t'),
-        ...result.value.rows.map((row) =>
-          row.map((v) => (v === null ? 'NULL' : String(v))).join('\t'),
-        ),
-      ].join('\n'),
+    await window.vork.copyResult(
+      props.session.id,
+      {
+        ...result.value,
+        columns: [...result.value.columns],
+        rows: result.value.rows.map((row) => [...row]),
+      },
+      format,
+      format === 'sql' ? insertTable.value : undefined,
     )
+    if (!mounted) return
+    insertOpen.value = false
     copied.value = true
+    notifications.notify(
+      `已复制 ${result.value.rows.length} 行${result.value.truncated ? '（仅当前截断结果）' : ''}`,
+    )
+    if (copyTimer) clearTimeout(copyTimer)
     copyTimer = setTimeout(() => (copied.value = false), 1500)
-  } catch {
-    error.value = '无法访问剪贴板'
+  } catch (e) {
+    if (mounted) error.value = e instanceof Error ? e.message : '复制失败'
+  } finally {
+    exporting.value = false
   }
 }
 onBeforeUnmount(() => {
@@ -240,6 +307,50 @@ onBeforeUnmount(() => {
 </script>
 <template>
   <div ref="container" class="flex h-full min-h-0 min-w-0">
+    <Dialog v-model:open="aiReview"
+      ><dialog-content class="sm:max-w-2xl"
+        ><dialog-header
+          ><dialog-title>确认执行 AI SQL</dialog-title
+          ><dialog-description
+            >AI 建议可能有误。请核对目标数据库、SQL
+            和写入影响；执行后可能无法回滚。</dialog-description
+          ></dialog-header
+        >
+        <pre
+          class="max-h-80 overflow-auto rounded-md border p-3 text-xs break-all whitespace-pre-wrap"
+          >{{ aiSql }}</pre>
+        <div class="flex justify-end gap-2">
+          <Button variant="outline" @click="aiReview = false">取消</Button
+          ><Button :disabled="closed || metadataBusy || mutation.isPending.value" @click="confirmAi"
+            >确认执行 AI SQL</Button
+          >
+        </div></dialog-content
+      ></Dialog
+    >
+    <query-plan-dialog
+      v-model:open="planOpen"
+      :session="session"
+      :sql="selection.trim() || command"
+      :closed="closed"
+      @busy="metadataBusy = $event"
+    />
+    <ai-sql-assistant
+      v-model:open="aiOpen"
+      :session="session"
+      :sql="selection.trim() || command"
+      :last-error="error"
+      :context="completionTables.length ? JSON.stringify(completionTables, null, 2) : ''"
+      :closed="closed"
+      @load="applyAi"
+    />
+    <schema-browser
+      v-if="schemaObject"
+      v-model:open="schemaOpen"
+      :session="session"
+      :table="schemaObject"
+      :closed="closed"
+      @busy="metadataBusy = $event"
+    />
     <data-browser
       v-if="dataObject"
       v-model:open="dataOpen"
@@ -271,6 +382,7 @@ onBeforeUnmount(() => {
       @execute="executeSql"
       @completion="completionTables = $event"
       @browse="browseTable"
+      @schema="browseSchema"
     />
     <resize-handle
       axis="horizontal"
@@ -340,6 +452,22 @@ onBeforeUnmount(() => {
           </dropdown-menu>
 
           <Button
+            variant="outline"
+            size="icon-sm"
+            aria-label="查看执行计划"
+            title="执行计划"
+            :disabled="closed || metadataBusy || mutation.isPending.value || !command.trim()"
+            @click="planOpen = true"
+            ><git-branch :size="14" /></Button
+          ><Button
+            variant="outline"
+            size="icon-sm"
+            aria-label="AI SQL 助手"
+            title="AI SQL 助手"
+            :disabled="closed || mutation.isPending.value"
+            @click="aiOpen = true"
+            ><sparkles :size="14" /></Button
+          ><Button
             variant="outline"
             size="icon-sm"
             aria-label="SQL 收藏片段"
@@ -426,24 +554,45 @@ onBeforeUnmount(() => {
           <div class="text-muted-foreground flex items-center gap-3 text-xs">
             <span v-if="outputTab === 'results' && result" class="flex items-center gap-1"
               ><clock3 :size="12" />{{ result.elapsedMs }} ms</span
-            ><Button
-              v-if="outputTab === 'results' && result"
-              variant="ghost"
-              size="icon"
-              class="size-7"
-              aria-label="导出 CSV"
-              :disabled="closed || exporting"
-              @click="exportRows"
-              ><Download :size="13" /></Button
-            ><Button
-              v-if="outputTab === 'results' && result"
-              size="icon"
-              variant="ghost"
-              class="size-7"
-              aria-label="复制结果"
-              @click="copy"
-              ><check v-if="copied" :size="13" /><Copy v-else :size="13"
-            /></Button>
+            ><dropdown-menu v-if="outputTab === 'results' && result"
+              ><dropdown-menu-trigger as-child
+                ><Button
+                  variant="ghost"
+                  size="icon"
+                  class="size-7"
+                  aria-label="导出结果"
+                  :disabled="closed || exporting"
+                  ><Download :size="13" /></Button></dropdown-menu-trigger
+              ><dropdown-menu-content align="end"
+                ><dropdown-menu-item @select="exportRows('csv')">CSV</dropdown-menu-item
+                ><dropdown-menu-item @select="exportRows('json')">JSON</dropdown-menu-item
+                ><dropdown-menu-item @select="exportRows('markdown')">Markdown</dropdown-menu-item
+                ><dropdown-menu-item @select="exportRows('xlsx')">Excel (.xlsx)</dropdown-menu-item
+                ><dropdown-menu-item @select="openInsert('export')"
+                  >INSERT SQL…</dropdown-menu-item
+                ></dropdown-menu-content
+              ></dropdown-menu
+            ><dropdown-menu v-if="outputTab === 'results' && result"
+              ><dropdown-menu-trigger as-child
+                ><Button
+                  size="icon"
+                  variant="ghost"
+                  class="size-7"
+                  aria-label="复制结果"
+                  :disabled="closed || exporting"
+                  ><check v-if="copied" :size="13" /><Copy
+                    v-else
+                    :size="13" /></Button></dropdown-menu-trigger
+              ><dropdown-menu-content align="end"
+                ><dropdown-menu-item @select="copy('tsv')">带表头 TSV</dropdown-menu-item
+                ><dropdown-menu-item @select="copy('csv')">CSV</dropdown-menu-item
+                ><dropdown-menu-item @select="copy('json')">JSON</dropdown-menu-item
+                ><dropdown-menu-item @select="copy('markdown')">Markdown</dropdown-menu-item
+                ><dropdown-menu-item @select="openInsert('copy')"
+                  >INSERT SQL…</dropdown-menu-item
+                ></dropdown-menu-content
+              ></dropdown-menu
+            >
           </div>
         </div>
         <template v-if="outputTab === 'results'">
@@ -513,5 +662,19 @@ onBeforeUnmount(() => {
         </div>
       </div>
     </div>
+    <Dialog v-model:open="insertOpen"
+      ><dialog-content
+        ><dialog-header
+          ><dialog-title>导出 INSERT SQL</dialog-title
+          ><dialog-description
+            >填写目标表名，字段使用查询结果列名。仅使用当前结果，不执行写入。</dialog-description
+          ></dialog-header
+        ><Input v-model="insertTable" aria-label="INSERT 目标表名" placeholder="目标表名" /><Button
+          :disabled="!insertTable.trim() || exporting || closed"
+          @click="insertAction === 'copy' ? copy('sql') : exportRows('sql')"
+          >{{ insertAction === 'copy' ? '复制 SQL' : '导出 SQL 文件' }}</Button
+        ></dialog-content
+      ></Dialog
+    >
   </div>
 </template>

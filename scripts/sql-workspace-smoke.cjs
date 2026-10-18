@@ -53,14 +53,6 @@ const timer = setTimeout(() => {
         username: 'vork',
         password: 'vork_test_only',
       },
-      { name: 'Docker Redis', type: 'redis', port: port('redis', 6379) },
-      {
-        name: 'Docker SSH',
-        type: 'ssh',
-        port: port('ssh', 2222),
-        username: 'vork',
-        password: 'vork_test_only',
-      },
     ]
       .filter((c) => c.port && ['mysql', 'postgresql'].includes(c.type))
       .map((c) => ({ ...c, host: '127.0.0.1' }))

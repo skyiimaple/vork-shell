@@ -291,7 +291,7 @@ app.whenReady().then(async () => {
     )
     await waitFor(
       window,
-      `document.querySelector('[aria-label="SQL 查询"]').textContent === 'SELECT * FROM "main"."ui table" LIMIT 1000;' && document.querySelector('button[aria-label="导出 CSV"]') !== null && !document.body.textContent.includes('此会话已有命令正在执行')`,
+      `document.querySelector('[aria-label="SQL 查询"]').textContent === 'SELECT * FROM "main"."ui table" LIMIT 1000;' && document.querySelector('button[aria-label="导出结果"]') !== null && !document.body.textContent.includes('此会话已有命令正在执行')`,
     )
     await pause(200)
     await window.webContents.executeJavaScript(

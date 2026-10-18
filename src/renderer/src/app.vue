@@ -69,7 +69,7 @@ import {
   ContextMenuContent,
   ContextMenuItem,
 } from '@/components/ui/context-menu'
-import { decodeWorkspace, encodeWorkspace, workspaceKey } from '@/lib/workspace'
+import { type QueryDrafts, decodeWorkspace, encodeWorkspace, workspaceKey } from '@/lib/workspace'
 import { duplicateProfile } from '@/lib/connection-actions'
 import ReleasePage from '@/components/release-page.vue'
 import ConnectionDialog from '@/components/connection-dialog.vue'
@@ -138,6 +138,7 @@ const appSettingsOpen = ref(false),
 const releaseOpen = ref(false)
 const settingsOpen = ref(false),
   historyOpen = ref(false)
+const queryDrafts = ref<Record<string, QueryDrafts>>({})
 const drafts = ref<Record<string, string>>({})
 const restoredIds = new Set<string>()
 const connectingProfile = ref(''),
@@ -376,6 +377,7 @@ async function close(id: string) {
   sessions.value = sessions.value.filter((s) => s.id !== id)
   delete closed.value[id]
   delete preparedQueries.value[id]
+  delete queryDrafts.value[id]
   delete drafts.value[id]
   restoredIds.delete(id)
   if (active.value === id)
@@ -443,6 +445,8 @@ async function reconnect(session: Session) {
       drafts.value[next.id] = drafts.value[session.id]!
       preparedQueries.value[next.id] = { sql: drafts.value[next.id]!, version: Date.now() }
     }
+    if (queryDrafts.value[session.id]) queryDrafts.value[next.id] = queryDrafts.value[session.id]!
+    delete queryDrafts.value[session.id]
     sessions.value.splice(index, 1, next)
     if (active.value === session.id) active.value = next.id
     delete closed.value[session.id]
@@ -458,7 +462,11 @@ async function reconnect(session: Session) {
 let warnedWorkspaceLimit = false
 function saveWorkspace() {
   const oversized =
-    sessions.value.length > 20 || Object.values(drafts.value).some((sql) => sql.length > 65536)
+    sessions.value.length > 20 ||
+    Object.values(drafts.value).some((sql) => sql.length > 65536) ||
+    Object.values(queryDrafts.value).some((state) =>
+      state.tabs.some((tab) => tab.sql.length > 65536),
+    )
   if (oversized && !warnedWorkspaceLimit)
     notify('工作区最多恢复20个标签，每份SQL草稿保留前64 KiB；退出前请备份超限内容。')
   warnedWorkspaceLimit = oversized
@@ -466,7 +474,11 @@ function saveWorkspace() {
     localStorage.setItem(
       workspaceKey,
       encodeWorkspace(
-        sessions.value.map((session) => ({ session, sql: drafts.value[session.id] || '' })),
+        sessions.value.map((session) => ({
+          session,
+          sql: drafts.value[session.id] || '',
+          queries: queryDrafts.value[session.id],
+        })),
         active.value,
       ),
     )
@@ -482,6 +494,7 @@ if (desktop) {
       sessions.value.push(session)
       closed.value[session.id] = '待重连'
       restoredIds.add(session.id)
+      if (tab.queries) queryDrafts.value[session.id] = tab.queries
       drafts.value[session.id] = tab.sql
       if (['sqlite', 'mysql', 'postgresql'].includes(session.type))
         preparedQueries.value[session.id] = { sql: tab.sql, version: Date.now() }
@@ -491,7 +504,7 @@ if (desktop) {
 }
 let workspaceTimer: ReturnType<typeof setTimeout> | undefined
 watch(
-  [sessions, active, drafts],
+  [sessions, active, drafts, queryDrafts],
   () => {
     if (desktop) {
       clearTimeout(workspaceTimer)
@@ -1171,8 +1184,10 @@ onBeforeUnmount(() => {
                   :closed="Boolean(closed[session.id])" /><query-panel
                   v-else
                   :prepared="preparedQueries[session.id]"
+                  :restored="queryDrafts[session.id]"
                   :session="session"
                   :closed="Boolean(closed[session.id])"
+                  @snapshot="queryDrafts[session.id] = $event"
                   @draft="recordDraft(session.id, $event)"
               /></panel-error-boundary>
             </div>

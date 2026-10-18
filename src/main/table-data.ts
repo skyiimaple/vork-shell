@@ -33,6 +33,180 @@ function simple(type: string): boolean {
 }
 export class TableDataService {
   private snapshots = new Map<string, Snapshot>()
+  private plans = new Map<
+    string,
+    {
+      table: DataTable
+      columns: DataColumn[]
+      sql: string
+      parameters: Cell[]
+      created: number
+      requestedRows?: number
+    }
+  >()
+  private validCell(value: unknown) {
+    if (
+      (value !== null && !['string', 'number', 'boolean'].includes(typeof value)) ||
+      (typeof value === 'number' && !Number.isFinite(value)) ||
+      (typeof value === 'string' && Buffer.byteLength(value) > 65536)
+    )
+      throw new Error('字段值无效或超过64 KiB')
+  }
+  private signature(columns: DataColumn[]) {
+    return JSON.stringify(columns.map(({ editable: _editable, ...column }) => column))
+  }
+  private plan(
+    table: DataTable,
+    columns: DataColumn[],
+    sql: string,
+    parameters: Cell[],
+    requestedRows?: number,
+  ) {
+    const token = randomUUID()
+    this.plans.set(token, { table, columns, sql, parameters, created: Date.now(), requestedRows })
+    while (this.plans.size > 2) this.plans.delete(this.plans.keys().next().value!)
+    return {
+      kind: 'mutation-preview' as const,
+      token,
+      sql,
+      parameters,
+      ...(requestedRows ? { requestedRows } : {}),
+    }
+  }
+  private async previewInsert(input: Extract<TableRequest, { kind: 'preview-insert' }>) {
+    const table = { schema: input.table?.schema, name: input.table?.name }
+    const meta = await this.metadata(table)
+    if (!meta.regular || !Array.isArray(input.values) || input.values.length > meta.columns.length)
+      throw new Error('此对象不支持新增行或字段参数无效')
+    const names = new Set<string>(),
+      parameters: Cell[] = []
+    for (const item of input.values) {
+      const column = meta.columns.find((column) => column.name === item?.column)
+      if (
+        !column ||
+        !(column.editable || column.primaryKey > 0) ||
+        !simple(column.type) ||
+        names.has(item.column)
+      )
+        throw new Error('字段不支持写入或重复')
+      this.validCell(item.value)
+      names.add(item.column)
+      parameters.push(item.value)
+    }
+    const sql =
+      'INSERT INTO ' +
+      this.qualified(table) +
+      (names.size
+        ? ' (' +
+          [...names].map((name) => quote(name, this.type)).join(', ') +
+          ') VALUES (' +
+          parameters.map((_, i) => this.mark(i + 1)).join(', ') +
+          ')'
+        : this.type === 'mysql'
+          ? ' () VALUES ()'
+          : ' DEFAULT VALUES')
+    return this.plan(table, meta.columns, sql, parameters)
+  }
+  private rowConditions(snapshot: Snapshot, rowIndex: number, parameters: Cell[]) {
+    const conditions = snapshot.columns.map((column, index) => {
+      const value = snapshot.rows[rowIndex]![index]!
+      parameters.push(value)
+      let left = quote(column.name, this.type),
+        right = this.mark(parameters.length)
+      if (typeof value === 'string') {
+        if (this.type === 'mysql') {
+          left = 'BINARY ' + left
+          right = 'BINARY ' + right
+        } else if (this.type === 'sqlite') left += ' COLLATE BINARY'
+        else if (/^(text|char|character|varchar)/i.test(column.type)) left += ' COLLATE "C"'
+      }
+      return (
+        left +
+        (this.type === 'mysql'
+          ? ' <=> '
+          : this.type === 'postgresql'
+            ? ' IS NOT DISTINCT FROM '
+            : ' IS ') +
+        right
+      )
+    })
+    return '(' + conditions.join(' AND ') + ')'
+  }
+  private selectedSnapshot(snapshotId: string, indices: number[]) {
+    const snapshot = this.snapshots.get(snapshotId)
+    if (
+      !snapshot ||
+      !Array.isArray(indices) ||
+      !indices.length ||
+      indices.length > 100 ||
+      new Set(indices).size !== indices.length ||
+      indices.some((index) => !Number.isInteger(index) || !snapshot.rows[index])
+    )
+      throw new Error('数据快照已过期或所选行无效，请刷新')
+    if (!snapshot.columns.every((column) => simple(column.type)))
+      throw new Error('当前表含复杂字段，暂不能安全比较整行写入')
+    if (indices.length * snapshot.columns.length > 10000)
+      throw new Error('写入参数超过10000个，请减少所选行')
+    return snapshot
+  }
+  private async previewUpdate(input: Extract<TableRequest, { kind: 'preview-update-many' }>) {
+    const snapshot = this.selectedSnapshot(input.snapshotId, input.rowIndices)
+    const column = snapshot.columns.find((column) => column.name === input.column)
+    if (!column?.editable || column.primaryKey || !simple(column.type))
+      throw new Error('此字段不可批量更新')
+    this.validCell(input.value)
+    const parameters: Cell[] = [input.value]
+    const conditions = input.rowIndices.map((index) =>
+      this.rowConditions(snapshot, index, parameters),
+    )
+    return this.plan(
+      snapshot.table,
+      snapshot.columns,
+      'UPDATE ' +
+        this.qualified(snapshot.table) +
+        ' SET ' +
+        quote(input.column, this.type) +
+        ' = ' +
+        this.mark(1) +
+        ' WHERE ' +
+        conditions.join(' OR '),
+      parameters,
+      input.rowIndices.length,
+    )
+  }
+  private async previewDelete(
+    input: Extract<TableRequest, { kind: 'preview-delete' | 'preview-delete-many' }>,
+  ) {
+    const indices = input.kind === 'preview-delete' ? [input.rowIndex] : input.rowIndices
+    const snapshot = this.selectedSnapshot(input.snapshotId, indices)
+    const parameters: Cell[] = []
+    const conditions = indices.map((index) => this.rowConditions(snapshot, index, parameters))
+    return this.plan(
+      snapshot.table,
+      snapshot.columns,
+      'DELETE FROM ' + this.qualified(snapshot.table) + ' WHERE ' + conditions.join(' OR '),
+      parameters,
+      input.kind === 'preview-delete-many' ? indices.length : undefined,
+    )
+  }
+  private async commit(token: string) {
+    const plan = this.plans.get(token)
+    if (!plan) throw new Error('预览已过期，请重新预览')
+    this.plans.delete(token)
+    const meta = await this.metadata(plan.table)
+    if (!meta.regular || this.signature(meta.columns) !== this.signature(plan.columns))
+      throw new Error('表结构已修改，请刷新后重新预览')
+    const result = await this.query(plan.sql, plan.parameters)
+    this.snapshots.clear()
+    if (plan.requestedRows !== undefined)
+      return {
+        kind: 'edited' as const,
+        affectedRows: result.affectedRows,
+        requestedRows: plan.requestedRows,
+      }
+    if (result.affectedRows !== 1) throw new Error('数据已修改或行已删除，发生冲突；请刷新后重试')
+    return { kind: 'edited' as const, affectedRows: 1 }
+  }
   constructor(
     private type: Dialect,
     private query: Query,
@@ -116,6 +290,13 @@ export class TableDataService {
     if (!input || typeof input !== 'object') throw new Error('数据表请求无效')
     for (const [id, snapshot] of this.snapshots)
       if (Date.now() - snapshot.created > 5 * 60 * 1000) this.snapshots.delete(id)
+    for (const [token, plan] of this.plans)
+      if (Date.now() - plan.created > 5 * 60 * 1000) this.plans.delete(token)
+    if (input.kind === 'preview-update-many') return this.previewUpdate(input)
+    if (input.kind === 'preview-insert') return this.previewInsert(input)
+    if (input.kind === 'preview-delete' || input.kind === 'preview-delete-many')
+      return this.previewDelete(input)
+    if (input.kind === 'commit') return this.commit(input.token)
     if (input.kind === 'edit') return this.edit(input)
     if (
       input.kind !== 'browse' ||
@@ -133,24 +314,43 @@ export class TableDataService {
     const names = new Set(meta.columns.map((column) => column.name)),
       parameters: Cell[] = [],
       where: string[] = []
-    if (input.filter) {
-      const f = input.filter
-      if (!names.has(f.column)) throw new Error('筛选字段不存在')
+    if (input.filter && input.filters) throw new Error('不能同时使用两种筛选参数')
+    const filters = input.filters ?? (input.filter ? [input.filter] : [])
+    if (
+      !Array.isArray(filters) ||
+      filters.length > 20 ||
+      (input.match !== undefined && !['all', 'any'].includes(input.match))
+    )
+      throw new Error('筛选条件无效或超过20条')
+    for (const f of filters) {
+      if (!f || !names.has(f.column)) throw new Error('筛选字段不存在')
       const column = quote(f.column, this.type)
-      if (f.operator === 'is-null' || f.operator === 'not-null')
+      if (f.operator === 'is-null' || f.operator === 'not-null') {
         where.push(column + (f.operator === 'is-null' ? ' IS NULL' : ' IS NOT NULL'))
-      else if (f.operator === 'eq' || f.operator === 'contains') {
-        if (typeof f.value !== 'string' || Buffer.byteLength(f.value) > 65536)
-          throw new Error('筛选值无效')
+        continue
+      }
+      this.validCell(f.value)
+      const operators = { eq: '=', ne: '<>', gt: '>', gte: '>=', lt: '<', lte: '<=' }
+      if (Object.hasOwn(operators, f.operator)) {
+        if (f.value === null) throw new Error('NULL 请使用为空或不为空筛选')
+        parameters.push(f.value!)
+        where.push(
+          column +
+            ' ' +
+            operators[f.operator as keyof typeof operators] +
+            ' ' +
+            this.mark(parameters.length),
+        )
+      } else if (['contains', 'not-contains', 'starts-with', 'ends-with'].includes(f.operator)) {
+        if (typeof f.value !== 'string') throw new Error('文本匹配需要文本值')
+        const value = f.value.replace(/[!%_]/g, (match) => '!' + match)
         parameters.push(
-          f.operator === 'contains'
-            ? '%' + f.value.replace(/[!%_]/g, (match) => '!' + match) + '%'
-            : f.value,
+          (f.operator === 'starts-with' ? '' : '%') +
+            value +
+            (f.operator === 'ends-with' ? '' : '%'),
         )
         where.push(
-          f.operator === 'eq'
-            ? column + ' = ' + this.mark(parameters.length)
-            : `CAST(${column} AS ${this.type === 'mysql' ? 'CHAR' : 'TEXT'}) LIKE ${this.mark(parameters.length)} ESCAPE '!'`,
+          `CAST(${column} AS ${this.type === 'mysql' ? 'CHAR' : 'TEXT'}) ${f.operator === 'not-contains' ? 'NOT LIKE' : 'LIKE'} ${this.mark(parameters.length)} ESCAPE '!'`,
         )
       } else throw new Error('筛选操作无效')
     }
@@ -187,7 +387,7 @@ export class TableDataService {
         projections.join(',') +
         ' FROM ' +
         this.qualified(table) +
-        (where.length ? ' WHERE ' + where.join(' AND ') : '') +
+        (where.length ? ' WHERE ' + where.join(input.match === 'any' ? ' OR ' : ' AND ') : '') +
         (order.length ? ' ORDER BY ' + order.join(',') : '') +
         pagination,
       parameters,
@@ -209,6 +409,11 @@ export class TableDataService {
       page: input.page,
       pageSize: input.pageSize,
       hasNext,
+      insertColumns: meta.regular
+        ? meta.columns
+            .filter((column) => simple(column.type) && (column.editable || column.primaryKey > 0))
+            .map((column) => column.name)
+        : undefined,
     }
     let reason = ''
     if (
@@ -236,11 +441,13 @@ export class TableDataService {
     if (reason) {
       page.readOnlyReason = reason
       page.columns = meta.columns.map((column) => ({ ...column, editable: false }))
-    } else if (rows.length && meta.columns.some((column) => column.editable)) {
+    } else if (rows.length) {
       const id = randomUUID()
       this.snapshots.set(id, { table, columns: meta.columns, rows, created: Date.now() })
       while (this.snapshots.size > 2) this.snapshots.delete(this.snapshots.keys().next().value!)
       page.snapshotId = id
+      page.canDelete = meta.columns.every((column) => simple(column.type))
+      page.canBatchUpdate = page.canDelete && meta.columns.some((column) => column.editable)
     }
     return page
   }

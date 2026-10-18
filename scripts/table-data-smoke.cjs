@@ -67,7 +67,10 @@ app.whenReady().then(async () => {
     await click(w, '[aria-label="连接 Local"]')
     await wait(w, `document.querySelector('[aria-label="刷新 SQL 对象"]')`)
     await click(w, '[aria-label="刷新 SQL 对象"]')
-    await wait(w, `document.querySelector('[aria-label="管理数据 main.items"]')`)
+    await wait(
+      w,
+      `document.querySelector('[aria-label="管理数据 main.items"]') && !document.querySelector('[aria-label="管理数据 main.items"]').disabled`,
+    )
     await click(w, '[aria-label="管理数据 main.items"]')
     await wait(
       w,
@@ -144,6 +147,128 @@ app.whenReady().then(async () => {
       `Array.from(document.querySelectorAll('[role=dialog] button')).find(b=>b.textContent==='取消').click()`,
     )
     await wait(w, `document.querySelector('[aria-label="单元格新值"]')===null`)
+    async function button(text) {
+      await w.webContents.executeJavaScript(
+        `Array.from(document.querySelectorAll('[role=dialog] button')).find(el=>el.textContent.trim()===${JSON.stringify(text)}).click()`,
+      )
+    }
+    const rowsDb = new DatabaseSync(database)
+    await button('新增行')
+    await wait(w, `Boolean(document.querySelector('[aria-label="新增字段类型 title"]'))`)
+    await select(w, '新增字段类型 title', '文本')
+    await input(w, '新增字段值 title', "new row ' ; --")
+    await button('预览 SQL')
+    await wait(w, `document.body.textContent.includes('待执行 SQL')`)
+    assert.equal(rowsDb.prepare('SELECT COUNT(*) AS n FROM items').get().n, 102)
+    await button('确认执行新增')
+    await wait(
+      w,
+      `!document.querySelector('[aria-label="新增字段类型 title"]') && document.body.textContent.includes('已完成行操作')`,
+    )
+    assert.equal(rowsDb.prepare('SELECT COUNT(*) AS n FROM items').get().n, 103)
+    await select(w, '数据筛选字段', 'title')
+    await input(w, '数据筛选值', "new row ' ; --")
+    await w.webContents.executeJavaScript(
+      `document.querySelector('[role=dialog] form').requestSubmit()`,
+    )
+    await wait(
+      w,
+      `document.querySelector('[aria-label="数据分页状态"]').textContent.includes('1 行')`,
+    )
+    await click(w, '[aria-label="选择第 1 行"]')
+    await pause(80)
+    await button('删除所选行')
+    await wait(w, `document.body.textContent.includes('确认删除所选行')`)
+    await button('预览 SQL')
+    await wait(w, `document.body.textContent.includes('DELETE FROM')`)
+    assert.equal(rowsDb.prepare('SELECT COUNT(*) AS n FROM items').get().n, 103)
+    await button('确认执行删除')
+    await wait(w, `!document.body.textContent.includes('确认删除所选行')`)
+    assert.equal(rowsDb.prepare('SELECT COUNT(*) AS n FROM items').get().n, 102)
+    await wait(
+      w,
+      `document.querySelector('[aria-label="数据分页状态"]').textContent.includes('0 行') && !document.body.textContent.includes('正在加载…')`,
+    )
+    await button('清空筛选')
+    await wait(w, `!document.body.textContent.includes('正在加载…')`)
+    await select(w, '数据筛选字段', 'score')
+    await select(w, '数据筛选方式', '大于等于')
+    await input(w, '数据筛选值', '100')
+    await button('添加条件')
+    await select(w, '数据筛选字段', 'title')
+    await select(w, '数据筛选方式', '开头匹配')
+    await input(w, '数据筛选值', 'row-')
+    await button('应用筛选')
+    await wait(
+      w,
+      `document.querySelector('[aria-label="数据分页状态"]').textContent.includes('2 行') && !document.body.textContent.includes('正在加载…')`,
+    )
+    assert.ok(
+      await w.webContents.executeJavaScript(
+        `document.querySelector('[aria-label="已添加筛选条件"]').textContent.includes('大于等于')`,
+      ),
+    )
+    await click(w, '[aria-label="选择当前页全部行"]')
+    await wait(
+      w,
+      `Array.from(document.querySelectorAll('button')).some(el=>el.textContent.includes('批量删除 · 2')&&!el.disabled)`,
+    )
+    await button('批量删除 · 2')
+    await wait(w, `document.body.textContent.includes('确认批量删除 2 行')`)
+    await button('预览 SQL')
+    await wait(w, `document.body.textContent.includes('DELETE FROM')`)
+    assert.equal(rowsDb.prepare('SELECT COUNT(*) AS n FROM items').get().n, 102)
+    rowsDb.exec("UPDATE items SET title='concurrent batch change' WHERE id=100")
+    await button('确认执行删除')
+    await wait(
+      w,
+      `document.body.textContent.includes('已删除 1 / 2 行') && !document.body.textContent.includes('正在加载…')`,
+    )
+    assert.equal(rowsDb.prepare('SELECT COUNT(*) AS n FROM items').get().n, 101)
+    assert.equal(
+      rowsDb.prepare('SELECT title FROM items WHERE id=100').get().title,
+      'concurrent batch change',
+    )
+    assert.equal(rowsDb.prepare('SELECT id FROM items WHERE id=101').get(), undefined)
+    await wait(
+      w,
+      `Array.from(document.querySelectorAll('button')).some(el=>el.textContent.includes('批量删除 · 0')&&el.disabled)`,
+    )
+    await button('清空筛选')
+    await wait(w, `!document.body.textContent.includes('正在加载…')`)
+    await select(w, '数据筛选字段', 'id')
+    await select(w, '数据筛选方式', '小于等于')
+    await input(w, '数据筛选值', '2')
+    await button('应用筛选')
+    await wait(
+      w,
+      `document.querySelector('[aria-label="数据分页状态"]').textContent.includes('2 行') && !document.body.textContent.includes('正在加载…')`,
+    )
+    await click(w, '[aria-label="选择当前页全部行"]')
+    await button('批量更新 · 2')
+    await wait(w, `document.body.textContent.includes('确认批量更新 2 行')`)
+    await select(w, '批量更新字段', 'score')
+    await select(w, '新增字段类型 score', '数字')
+    await input(w, '新增字段值 score', '77')
+    await button('预览 SQL')
+    await wait(w, `document.body.textContent.includes('UPDATE')`)
+    assert.notEqual(rowsDb.prepare('SELECT score FROM items WHERE id=1').get().score, 77)
+    rowsDb.exec("UPDATE items SET title='concurrent update' WHERE id=2")
+    await button('确认执行更新')
+    await wait(
+      w,
+      `document.body.textContent.includes('已更新 1 / 2 行') && !document.body.textContent.includes('正在加载…')`,
+    )
+    assert.equal(rowsDb.prepare('SELECT score FROM items WHERE id=1').get().score, 77)
+    assert.notEqual(rowsDb.prepare('SELECT score FROM items WHERE id=2').get().score, 77)
+    await wait(
+      w,
+      `Array.from(document.querySelectorAll('button')).some(el=>el.textContent.includes('批量更新 · 0')&&el.disabled)`,
+    )
+    rowsDb.close()
+    console.log(
+      'Row insert/delete and batch delete/update previews, concurrent-row protection, affected counts and persistence passed',
+    )
     mkdirSync(resolve('.artifacts'), { recursive: true })
     writeFileSync(resolve('.artifacts/table-data.png'), (await w.webContents.capturePage()).toPNG())
     const sessionId = await w.webContents.executeJavaScript(

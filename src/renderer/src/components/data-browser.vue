@@ -19,8 +19,13 @@ import {
   SelectItem,
 } from '@/components/ui/select'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import DataRowMutation from './data-row-mutation.vue'
+const rowAction = ref<'insert' | 'delete' | 'delete-many' | 'update-many'>('insert'),
+  rowOpen = ref(false),
+  selectedRow = ref<number>(),
+  selectedRows = ref<number[]>([])
 import ResultTable from './result-table.vue'
-import type { Cell, Session, DataTable, TablePage, TableRequest } from '../../../shared/contracts'
+import type { Cell, Session, DataTable, TablePage, TableFilter } from '../../../shared/contracts'
 const props = defineProps<{
   table: DataTable
   session: Session
@@ -38,7 +43,10 @@ const sort = ref<{ column: string; descending: boolean }>(),
   filterColumn = ref('none'),
   filterOperator = ref('eq'),
   filterValue = ref('')
-const appliedFilter = ref<Extract<TableRequest, { kind: 'browse' }>['filter']>()
+const conditions = ref<TableFilter[]>([]),
+  match = ref<'all' | 'any'>('all'),
+  appliedFilters = ref<TableFilter[]>([]),
+  appliedMatch = ref<'all' | 'any'>('all')
 const editing = ref<{ snapshotId: string; rowIndex: number; column: string; original: Cell }>(),
   editValue = ref(''),
   editType = ref('text'),
@@ -53,6 +61,8 @@ let request = 0,
   mounted = true
 async function load(page = 0) {
   if (props.closed || loading.value || saving.value) return
+  selectedRow.value = undefined
+  selectedRows.value = []
   const current = ++request
   loading.value = true
   error.value = ''
@@ -64,7 +74,8 @@ async function load(page = 0) {
       page,
       pageSize: Number(pageSize.value),
       ...(sort.value ? { sort: { ...sort.value } } : {}),
-      ...(appliedFilter.value ? { filter: { ...appliedFilter.value } } : {}),
+      filters: appliedFilters.value.map((filter) => ({ ...filter })),
+      match: appliedMatch.value,
     })
     if (mounted && current === request && response.kind === 'page') data.value = response
   } catch (e) {
@@ -82,7 +93,9 @@ watch(
     if (value) {
       data.value = undefined
       sort.value = undefined
-      appliedFilter.value = undefined
+      appliedFilters.value = []
+      conditions.value = []
+      match.value = 'all'
       filterColumn.value = 'none'
       filterValue.value = ''
       error.value = ''
@@ -98,17 +111,51 @@ watch(
   },
   { immediate: true },
 )
+const operatorNames: Record<TableFilter['operator'], string> = {
+  eq: '等于',
+  ne: '不等于',
+  gt: '大于',
+  gte: '大于等于',
+  lt: '小于',
+  lte: '小于等于',
+  contains: '包含',
+  'not-contains': '不包含',
+  'starts-with': '开头匹配',
+  'ends-with': '结尾匹配',
+  'is-null': '为空',
+  'not-null': '不为空',
+}
+function currentFilter(): TableFilter | undefined {
+  return filterColumn.value === 'none'
+    ? undefined
+    : {
+        column: filterColumn.value.slice(7),
+        operator: filterOperator.value as TableFilter['operator'],
+        value: filterValue.value,
+      }
+}
+function addFilter() {
+  const filter = currentFilter()
+  if (busy.value || !filter || conditions.value.length >= 20) return
+  conditions.value.push(filter)
+  filterColumn.value = 'none'
+  filterValue.value = ''
+}
 function applyFilter() {
   if (busy.value) return
-  appliedFilter.value =
-    filterColumn.value === 'none'
-      ? undefined
-      : {
-          column: filterColumn.value.slice(7),
-          operator: filterOperator.value as 'eq' | 'contains' | 'is-null' | 'not-null',
-          value: filterValue.value,
-        }
+  const filter = currentFilter()
+  appliedFilters.value = [
+    ...conditions.value.map((item) => ({ ...item })),
+    ...(filter ? [filter] : []),
+  ]
+  appliedMatch.value = match.value
   void load()
+}
+function clearFilters() {
+  conditions.value = []
+  filterColumn.value = 'none'
+  filterValue.value = ''
+  applyFilter()
 }
 function sortBy(column: string) {
   if (busy.value) return
@@ -188,6 +235,21 @@ onBeforeUnmount(() => {
   request++
   emit('busy', false)
 })
+function startRow(action: 'insert' | 'delete' | 'delete-many' | 'update-many') {
+  rowAction.value = action
+  rowOpen.value = true
+}
+function rowBusy(value: boolean) {
+  saving.value = value
+  emit('busy', value)
+}
+function rowApplied(affectedRows: number, requestedRows?: number) {
+  notice.value =
+    requestedRows !== undefined
+      ? `已${rowAction.value === 'update-many' ? '更新' : '删除'} ${affectedRows} / ${requestedRows} 行${affectedRows !== requestedRows ? '；未匹配的行可能已被修改或删除，请核对刷新后的数据。' : ''}`
+      : '已完成行操作'
+  void load(data.value?.page ?? 0)
+}
 function refreshPage() {
   notice.value = ''
   void load(data.value?.page ?? 0)
@@ -227,10 +289,12 @@ function refreshPage() {
         <Select v-model="filterOperator" :disabled="busy || filterColumn === 'none'"
           ><select-trigger aria-label="数据筛选方式" class="w-32"><select-value /></select-trigger
           ><select-content
-            ><select-item value="eq">等于</select-item
-            ><select-item value="contains">包含文本</select-item
-            ><select-item value="is-null">为空 NULL</select-item
-            ><select-item value="not-null">不为空</select-item></select-content
+            ><select-item
+              v-for="(title, operator) in operatorNames"
+              :key="operator"
+              :value="operator"
+              >{{ title }}</select-item
+            ></select-content
           ></Select
         >
         <Input
@@ -242,12 +306,69 @@ function refreshPage() {
             busy || filterColumn === 'none' || ['is-null', 'not-null'].includes(filterOperator)
           "
         />
+        <Button
+          type="button"
+          variant="outline"
+          :disabled="busy || filterColumn === 'none' || conditions.length >= 20"
+          @click="addFilter"
+          >添加条件</Button
+        >
+        <Select v-model="match" :disabled="busy"
+          ><select-trigger aria-label="筛选组合方式" class="w-32"><select-value /></select-trigger
+          ><select-content
+            ><select-item value="all">全部满足</select-item
+            ><select-item value="any">任一满足</select-item></select-content
+          ></Select
+        >
+        <Button type="button" variant="ghost" :disabled="busy" @click="clearFilters"
+          >清空筛选</Button
+        >
         <Button type="submit" variant="outline" :disabled="busy">应用筛选</Button
         ><Button type="button" variant="outline" :disabled="busy" @click="refreshPage()"
           >刷新数据</Button
         >
+        <Button
+          type="button"
+          variant="outline"
+          :disabled="busy || executing || !data?.insertColumns?.length"
+          @click="startRow('insert')"
+          >新增行</Button
+        ><Button
+          type="button"
+          variant="destructive"
+          :disabled="busy || executing || !data?.canDelete || selectedRow === undefined"
+          @click="startRow('delete')"
+          >删除所选行</Button
+        >
+        <Button
+          type="button"
+          variant="destructive"
+          :disabled="busy || executing || !data?.canDelete || !selectedRows.length"
+          @click="startRow('delete-many')"
+          >批量删除 · {{ selectedRows.length }}</Button
+        >
+        <Button
+          type="button"
+          variant="outline"
+          :disabled="busy || executing || !data?.canBatchUpdate || !selectedRows.length"
+          @click="startRow('update-many')"
+          >批量更新 · {{ selectedRows.length }}</Button
+        >
         <span v-if="loading" class="text-muted-foreground text-xs">正在加载…</span>
       </form>
+      <div v-if="conditions.length" class="flex flex-wrap gap-2" aria-label="已添加筛选条件">
+        <Button
+          v-for="(condition, index) in conditions"
+          :key="index"
+          variant="secondary"
+          size="sm"
+          :disabled="busy"
+          :aria-label="`移除筛选条件 ${index + 1}`"
+          @click="conditions.splice(index, 1)"
+          >{{ condition.column }} · {{ operatorNames[condition.operator] }}
+          {{ condition.value }} ×</Button
+        >
+      </div>
       <alert v-if="error && !editing" variant="destructive"
         ><alert-description>{{ error }}</alert-description></alert
       >
@@ -266,8 +387,12 @@ function refreshPage() {
           :result="data.result"
           :editable-columns="editableColumns"
           :disabled="busy"
+          selectable
+          multi-select
           server-sorting
           :sort="sort"
+          @selection-change="selectedRows = $event"
+          @select="selectedRow = $event"
           @sort="sortBy"
           @edit="startEdit"
         />
@@ -311,6 +436,19 @@ function refreshPage() {
       </p>
     </dialog-content></Dialog
   >
+  <data-row-mutation
+    v-model:open="rowOpen"
+    :session="session"
+    :table="table"
+    :columns="rowAction === 'update-many' ? editableColumns : data?.insertColumns || []"
+    :action="rowAction"
+    :snapshot-id="data?.snapshotId"
+    :row-index="selectedRow"
+    :row-indices="selectedRows"
+    :closed="closed"
+    @busy="rowBusy"
+    @applied="rowApplied"
+  />
   <Dialog
     :open="Boolean(editing)"
     @update:open="

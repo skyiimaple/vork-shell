@@ -321,3 +321,197 @@ it('reads unkeyed PostgreSQL JSON-only tables without inventing an unsupported s
   expect(pageSql).not.toContain('ORDER BY')
   expect(page.snapshotId).toBeUndefined()
 })
+
+it('previews and confirms inserts once, preserving defaults and literal values', async () => {
+  const { db, service } = setup(
+    "CREATE TABLE items(id INTEGER PRIMARY KEY, title TEXT DEFAULT 'default', score INTEGER)",
+  )
+  const preview = await service.request({
+    kind: 'preview-insert',
+    table: request.table,
+    values: [{ column: 'score', value: 9 }],
+  })
+  if (preview.kind !== 'mutation-preview') throw Error()
+  expect(preview.sql).toContain('INSERT INTO "main"."items" ("score") VALUES (?)')
+  expect(db.prepare('SELECT COUNT(*) AS n FROM items').get()?.n).toBe(0)
+  await service.request({ kind: 'commit', token: preview.token })
+  expect(db.prepare('SELECT title,score FROM items').get()).toMatchObject({
+    title: 'default',
+    score: 9,
+  })
+  await expect(service.request({ kind: 'commit', token: preview.token })).rejects.toThrow()
+})
+it('previews exact row deletion and rejects changes after preview', async () => {
+  const { db, service } = setup()
+  const page = await service.request(request)
+  if (page.kind !== 'page') throw Error()
+  const preview = await service.request({
+    kind: 'preview-delete',
+    snapshotId: page.snapshotId!,
+    rowIndex: 0,
+  })
+  if (preview.kind !== 'mutation-preview') throw Error()
+  expect(preview.sql).toContain('DELETE FROM')
+  db.exec("UPDATE items SET title='concurrent' WHERE id=1")
+  await expect(service.request({ kind: 'commit', token: preview.token })).rejects.toThrow('冲突')
+  expect(db.prepare('SELECT COUNT(*) AS n FROM items').get()?.n).toBe(3)
+  const fresh = await service.request(request)
+  if (fresh.kind !== 'page') throw Error()
+  const next = await service.request({
+    kind: 'preview-delete',
+    snapshotId: fresh.snapshotId!,
+    rowIndex: 1,
+  })
+  if (next.kind !== 'mutation-preview') throw Error()
+  await service.request({ kind: 'commit', token: next.token })
+  expect(
+    db
+      .prepare('SELECT id FROM items ORDER BY id')
+      .all()
+      .map((row) => row.id),
+  ).toEqual([1, 3])
+})
+
+it('rejects generated fields, views, expired previews and schema changes before commit', async () => {
+  const { db, service } = setup(
+    'CREATE TABLE items(id INTEGER PRIMARY KEY,title TEXT,score INTEGER GENERATED ALWAYS AS (length(title)) STORED); CREATE VIEW view_items AS SELECT * FROM items',
+  )
+  await expect(
+    service.request({
+      kind: 'preview-insert',
+      table: request.table,
+      values: [{ column: 'score', value: 5 }],
+    }),
+  ).rejects.toThrow()
+  await expect(
+    service.request({
+      kind: 'preview-insert',
+      table: { schema: 'main', name: 'view_items' },
+      values: [],
+    }),
+  ).rejects.toThrow()
+  const preview = await service.request({
+    kind: 'preview-insert',
+    table: request.table,
+    values: [{ column: 'title', value: 'safe' }],
+  })
+  if (preview.kind !== 'mutation-preview') throw Error()
+  db.exec('ALTER TABLE items ADD COLUMN other TEXT')
+  await expect(service.request({ kind: 'commit', token: preview.token })).rejects.toThrow('结构')
+  expect(db.prepare('SELECT COUNT(*) AS n FROM items').get()?.n).toBe(0)
+})
+
+it('combines typed comparisons and literal patterns with AND/OR', async () => {
+  const { service } = setup()
+  const get = async (filters: unknown[], match = 'all') => {
+    const r = await service.request({ ...request, filters, match } as never)
+    if (r.kind !== 'page') throw Error()
+    return r.result.rows.map((r) => r[0])
+  }
+  expect(
+    await get([
+      { column: 'score', operator: 'gte', value: 20 },
+      { column: 'title', operator: 'starts-with', value: 't' },
+    ]),
+  ).toEqual([2, 3])
+  expect(
+    await get(
+      [
+        { column: 'score', operator: 'lt', value: 20 },
+        { column: 'title', operator: 'ends-with', value: 'ree' },
+      ],
+      'any',
+    ),
+  ).toEqual([1, 3])
+  expect(await get([{ column: 'title', operator: 'not-contains', value: 'o' }])).toEqual([3])
+  await expect(
+    get(Array.from({ length: 21 }, () => ({ column: 'id', operator: 'eq', value: 1 }))),
+  ).rejects.toThrow()
+  await expect(get([{ column: 'id', operator: 'eq', value: {} }])).rejects.toThrow()
+})
+
+it('previews bounded batch deletion and reports rows changed since selection accurately', async () => {
+  const { db, service } = setup()
+  const page = await service.request(request)
+  if (page.kind !== 'page') throw Error()
+  const preview = await service.request({
+    kind: 'preview-delete-many',
+    snapshotId: page.snapshotId!,
+    rowIndices: [0, 1],
+  } as never)
+  if (preview.kind !== 'mutation-preview') throw Error()
+  expect(preview.parameters).toEqual([1, 'one', 10, 2, 'two', 20])
+  expect(db.prepare('SELECT COUNT(*) AS n FROM items').get()!.n).toBe(3)
+  db.exec("UPDATE items SET title='changed' WHERE id=2")
+  expect(await service.request({ kind: 'commit', token: preview.token })).toEqual({
+    kind: 'edited',
+    affectedRows: 1,
+    requestedRows: 2,
+  })
+  expect(
+    db
+      .prepare('SELECT id FROM items ORDER BY id')
+      .all()
+      .map((row) => row.id),
+  ).toEqual([2, 3])
+  await expect(service.request({ kind: 'commit', token: preview.token })).rejects.toThrow()
+  const next = await service.request(request)
+  if (next.kind !== 'page') throw Error()
+  for (const rowIndices of [[], [0, 0], [-1], [99]])
+    await expect(
+      service.request({
+        kind: 'preview-delete-many',
+        snapshotId: next.snapshotId!,
+        rowIndices,
+      } as never),
+    ).rejects.toThrow()
+})
+
+it('previews batch updates, protects keys and skips concurrently changed rows', async () => {
+  const { db, service } = setup()
+  const page = await service.request(request)
+  if (page.kind !== 'page') throw Error()
+  const input = {
+    kind: 'preview-update-many',
+    snapshotId: page.snapshotId!,
+    rowIndices: [0, 1],
+    column: 'score',
+    value: 99,
+  } as const
+  const plan = await service.request(input as never)
+  if (plan.kind !== 'mutation-preview') throw Error()
+  expect(plan.sql).toMatch(/^UPDATE/)
+  expect(plan.parameters[0]).toBe(99)
+  expect(db.prepare('SELECT score FROM items WHERE id=1').get()!.score).toBe(10)
+  db.exec("UPDATE items SET title='changed' WHERE id=2")
+  expect(await service.request({ kind: 'commit', token: plan.token })).toEqual({
+    kind: 'edited',
+    affectedRows: 1,
+    requestedRows: 2,
+  })
+  expect(
+    db
+      .prepare('SELECT score FROM items ORDER BY id')
+      .all()
+      .map((row) => row.score),
+  ).toEqual([99, 20, 30])
+  const fresh = await service.request(request)
+  if (fresh.kind !== 'page') throw Error()
+  await expect(
+    service.request({ ...input, snapshotId: fresh.snapshotId!, column: 'id' } as never),
+  ).rejects.toThrow()
+  const nullPlan = await service.request({
+    ...input,
+    snapshotId: fresh.snapshotId!,
+    rowIndices: [0, 2],
+    value: null,
+  } as never)
+  if (nullPlan.kind !== 'mutation-preview') throw Error()
+  await service.request({ kind: 'commit', token: nullPlan.token })
+  expect(
+    db
+      .prepare('SELECT score FROM items ORDER BY id')
+      .all()
+      .map((row) => row.score),
+  ).toEqual([null, 20, null])
+})

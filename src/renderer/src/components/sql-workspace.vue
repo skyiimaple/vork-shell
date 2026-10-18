@@ -4,13 +4,15 @@ import { Plus, X } from '@lucide/vue'
 import { Button } from '@/components/ui/button'
 import { Tabs as TabsRoot, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import QueryPanel from './query-panel.vue'
+import type { QueryDrafts } from '@/lib/workspace'
 import type { Session } from '../../../shared/contracts'
 const props = defineProps<{
   session: Session
   closed: boolean
+  restored?: QueryDrafts
   prepared?: { sql: string; version: number }
 }>()
-const emit = defineEmits<{ draft: [sql: string] }>()
+const emit = defineEmits<{ draft: [sql: string]; snapshot: [value: QueryDrafts] }>()
 type QueryTab = {
   id: string
   name: string
@@ -22,6 +24,7 @@ type QueryTab = {
   closed: boolean
   busy: boolean
 }
+const initialSnapshot = props.restored
 let sequence = 1,
   disposed = false
 const tabs = ref<QueryTab[]>([
@@ -36,7 +39,21 @@ const tabs = ref<QueryTab[]>([
     busy: false,
   },
 ])
-const active = ref(tabs.value[0]!.id),
+if (initialSnapshot) {
+  tabs.value = initialSnapshot.tabs.map((tab) => ({
+    ...tab,
+    session: props.session,
+    owned: false,
+    closed: true,
+    busy: false,
+    prepared: { sql: tab.sql, version: 1 },
+  }))
+  sequence = Math.max(
+    tabs.value.length,
+    ...tabs.value.map((tab) => Number(tab.name.match(/^Query (\d+)$/)?.[1]) || 0),
+  )
+}
+const active = ref(initialSnapshot?.active || tabs.value[0]!.id),
   working = ref(false),
   error = ref(''),
   databases = ref<string[]>([])
@@ -54,6 +71,19 @@ function draft(tab: QueryTab, sql: string) {
 watch(active, () => {
   if (current.value?.sql !== undefined) emit('draft', current.value.sql)
 })
+watch(
+  () => ({
+    active: active.value,
+    tabs: tabs.value.map((tab) => ({
+      id: tab.id,
+      name: tab.name,
+      sql: tab.sql ?? tab.prepared?.sql ?? '',
+      database: tab.database,
+    })),
+  }),
+  (value) => emit('snapshot', value),
+  { deep: true },
+)
 async function release(tab: QueryTab) {
   if (tab.owned && !tab.closed) {
     tab.closed = true
@@ -61,7 +91,7 @@ async function release(tab: QueryTab) {
   }
 }
 async function add() {
-  if (working.value || props.closed) return
+  if (working.value || props.closed || tabs.value.length >= 20) return
   working.value = true
   error.value = ''
   try {
@@ -156,7 +186,30 @@ watch(
     if (value) for (const tab of tabs.value) void release(tab)
   },
 )
-onMounted(() => void readDatabases())
+onMounted(async () => {
+  if (props.closed) return
+  working.value = true
+  try {
+    if (initialSnapshot)
+      for (const tab of tabs.value) {
+        const session = ['mysql', 'postgresql'].includes(props.session.type)
+          ? await window.vork.createQuerySession(props.session.id, tab.database || undefined)
+          : props.session
+        if (disposed || props.closed) {
+          if (session.id !== props.session.id) await window.vork.disconnect(session.id)
+          return
+        }
+        tab.session = session
+        tab.owned = session.id !== props.session.id
+        tab.closed = false
+      }
+    await readDatabases()
+  } catch (e) {
+    error.value = '查询标签恢复失败：' + (e as Error).message
+  } finally {
+    working.value = false
+  }
+})
 onBeforeUnmount(() => {
   disposed = true
   unsubscribe()
@@ -197,7 +250,7 @@ onBeforeUnmount(() => {
               size="icon-sm"
               aria-label="新建查询标签"
               title="新建查询标签"
-              :disabled="closed || working"
+              :disabled="closed || working || tabs.length >= 20"
               @click="add"
               ><plus :size="14"
             /></Button>

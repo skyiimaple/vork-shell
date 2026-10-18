@@ -37,7 +37,15 @@
     "test:release": "pnpm build && electron scripts/release-smoke.cjs",
     "prepare": "husky",
     "test:docker": "pnpm build && electron scripts/docker-services-smoke.cjs",
-    "test:mongodb": "pnpm build && electron scripts/mongodb-smoke.cjs"
+    "test:mongodb": "pnpm build && electron scripts/mongodb-smoke.cjs",
+    "test:result-export": "pnpm build && electron scripts/result-export-smoke.cjs",
+    "test:query-recovery": "pnpm build && electron scripts/query-recovery-smoke.cjs",
+    "test:schema-tools": "pnpm build && electron scripts/schema-tools-smoke.cjs",
+    "test:schema-column-edit": "pnpm build && electron scripts/schema-column-edit-smoke.cjs",
+    "test:ai-sql": "pnpm build && electron scripts/ai-sql-smoke.cjs",
+    "test:query-plan": "pnpm build && electron scripts/query-plan-smoke.cjs",
+    "test:er-diagram": "pnpm build && electron scripts/er-diagram-smoke.cjs",
+    "test:structure-compare": "pnpm build && electron scripts/structure-compare-smoke.cjs"
   },
   "dependencies": {
     "@codemirror/autocomplete": "^6.20.3",
@@ -57,6 +65,7 @@
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",
     "electron-updater": "6.8.9",
+    "exceljs": "4.4.0",
     "mongodb": "^7.7.0",
     "mysql2": "3.24.5",
     "pg": "8.23.1",

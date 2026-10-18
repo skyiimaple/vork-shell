@@ -1,16 +1,28 @@
 import electronUpdater from 'electron-updater'
 const { autoUpdater } = electronUpdater
 import { UpdateService } from './updates'
-import { app, BrowserWindow, dialog, ipcMain, safeStorage, screen, shell } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  clipboard,
+  dialog,
+  ipcMain,
+  safeStorage,
+  screen,
+  shell,
+} from 'electron'
 import { basename as localBasename, posix, join } from 'node:path'
 import { open, readFile, writeFile } from 'node:fs/promises'
 import type { ConnectionConfig, Reply } from '../shared/contracts'
+import { StructureCompareService } from './structure-compare'
+import { AiSettingsStore, AiService } from './ai-service'
 import { ActivityLog } from './activity-log'
 import { exportConnections } from './connection-export'
 import { SessionManager } from './sessions'
 import { remotePath } from './ssh-tools'
 import { registerSshBatch } from './ssh-batch'
-import { resultCsv } from './export'
+import { resultInsert, resultXlsx } from './result-formats'
+import { resultText } from './export'
 import { executeSqliteCommand } from './sqlite-dialog'
 import { HistoryStore } from './history'
 import { ProjectStore } from './projects'
@@ -20,6 +32,8 @@ import { readWindowState, saveWindowState } from './window-state'
 
 let window: BrowserWindow | null = null
 let sessions: SessionManager
+let ai: AiService
+let structures: StructureCompareService
 const devUrl = process.env.ELECTRON_RENDERER_URL
 // Packaged smoke tests use an isolated profile and a hidden window.
 if (process.env.VORK_TEST_WINDOW === '1' && process.env.VORK_TEST_USER_DATA)
@@ -53,6 +67,8 @@ async function verifyHost(config: ConnectionConfig, fingerprint: string) {
 
 function registerIpc() {
   const activity = new ActivityLog(app.getPath('userData'))
+  const aiSettings = new AiSettingsStore(app.getPath('userData'), safeStorage)
+  ai = new AiService(aiSettings)
   const secrets = new Set<string>()
   const connectionNames = new Map<string, string>()
   const rememberSecrets = (config: ConnectionConfig) => {
@@ -93,6 +109,48 @@ function registerIpc() {
     .list()
     .then((configs) => configs.forEach(rememberSecrets))
     .catch(() => {})
+  structures = new StructureCompareService(
+    {
+      open: async (owner, ref) => {
+        if (ref.kind === 'session') {
+          const session = sessions.getSession(owner, ref.id)
+          if (!['sqlite', 'mysql', 'postgresql'].includes(session.type))
+            throw new Error('此连接不支持结构对比')
+          return {
+            id: session.id,
+            source: {
+              ...ref,
+              name: session.name,
+              type: session.type as 'sqlite' | 'mysql' | 'postgresql',
+            },
+            temporary: false,
+          }
+        }
+        const config = (await profiles.list()).find((profile) => profile.id === ref.id)
+        if (!config || !['sqlite', 'mysql', 'postgresql'].includes(config.type))
+          throw new Error('保存的 SQL 连接不存在')
+        rememberSecrets(config)
+        const session = await sessions.connect(owner, config, true)
+        return {
+          id: session.id,
+          source: {
+            ...ref,
+            name: config.name,
+            type: config.type as 'sqlite' | 'mysql' | 'postgresql',
+          },
+          temporary: true,
+        }
+      },
+      close: (owner, id) => sessions.disconnect(owner, id).catch(() => {}),
+      tables: (owner, id, schema, after, signal, names) =>
+        sessions.structureTables(owner, id, schema, after, signal, names),
+      table: (owner, id, table, signal) => sessions.structureTable(owner, id, table, signal),
+    },
+    (owner, progress) => {
+      if (window && !window.isDestroyed() && window.webContents.id === owner)
+        window.webContents.send('vork:structure-progress', progress)
+    },
+  )
   const updates = new UpdateService(
     autoUpdater,
     app.isPackaged && __UPDATE_ENABLED__,
@@ -151,6 +209,11 @@ function registerIpc() {
         'mongo-request',
         'ssh-request',
         'table-request',
+        'schema-request',
+        'query-plan',
+        'er-request',
+        'ai-settings',
+        'structure-sources',
       ]
       let connection = ''
       if (channel === 'vork:connect' || channel === 'vork:save-profile') {
@@ -181,7 +244,13 @@ function registerIpc() {
         }
         if (!quiet.includes(operation)) await log('info', operation, connection, '操作完成')
         else if (
-          ['redis-request', 'mongo-request', 'ssh-request', 'table-request'].includes(operation) &&
+          [
+            'redis-request',
+            'mongo-request',
+            'ssh-request',
+            'table-request',
+            'schema-request',
+          ].includes(operation) &&
           args[1]?.kind &&
           ![
             'scan',
@@ -224,6 +293,50 @@ function registerIpc() {
       }
     })
   }
+  handle('vork:structure-sources', async (owner) => [
+    ...sessions.structureSources(owner),
+    ...(await profiles.list())
+      .filter((profile) => ['sqlite', 'mysql', 'postgresql'].includes(profile.type))
+      .map((profile) => ({
+        kind: 'profile',
+        id: profile.id!,
+        name: profile.name,
+        type: profile.type,
+      })),
+  ])
+  handle('vork:structure-compare', (owner, input) => structures.compare(owner, input))
+  handle('vork:structure-cancel', (owner, id) => structures.cancel(owner, id))
+  handle('vork:structure-export', async (owner, id) => {
+    const report = structures.report(owner, id),
+      destination = await dialog.showSaveDialog(window!, {
+        title: '导出结构对比报告',
+        defaultPath: 'structure-comparison.json',
+        filters: [{ name: 'JSON', extensions: ['json'] }],
+      })
+    if (destination.canceled || !destination.filePath) return null
+    await writeFile(destination.filePath, JSON.stringify(report, null, 2), { mode: 0o600 })
+    return destination.filePath
+  })
+  handle('vork:er-request', (owner, id, request) => sessions.erRequest(owner, id, request))
+  handle('vork:er-export', async (owner, id, snapshotId, positions, full) => {
+    const svg = sessions.erSvg(owner, id, snapshotId, positions, full)
+    const destination = await dialog.showSaveDialog(window!, {
+      title: '导出 ER 关系图',
+      defaultPath: 'er-diagram.svg',
+      filters: [{ name: 'SVG', extensions: ['svg'] }],
+    })
+    if (destination.canceled || !destination.filePath) return null
+    sessions.assertOwned(owner, id)
+    await writeFile(destination.filePath, svg, { mode: 0o600 })
+    return destination.filePath
+  })
+  handle('vork:query-plan', (owner, id, sql) => sessions.queryPlan(owner, id, sql))
+  handle('vork:ai-settings', () => aiSettings.settings())
+  handle('vork:ai-save-settings', (_, config) => aiSettings.save(config))
+  handle('vork:ai-complete', (owner, id, request) =>
+    ai.complete(owner, sessions.getSession(owner, id).type, request),
+  )
+  handle('vork:ai-cancel', (owner, id) => ai.cancel(owner, id))
   handle('vork:activity-logs', async () => ({
     path: activity.path,
     entries: await activity.list(),
@@ -252,6 +365,7 @@ function registerIpc() {
   handle('vork:open-project', () => shell.openExternal('https://github.com/skyiimaple/vork-shell'))
   handle('vork:update-state', () => updates.state())
   handle('vork:update-action', (_owner, action) => updates.action(action))
+  handle('vork:schema-request', (owner, id, request) => sessions.schemaRequest(owner, id, request))
   handle('vork:table-request', (owner, id, request) => sessions.tableRequest(owner, id, request))
   handle('vork:reconnect', (owner, id) => sessions.reconnect(owner, id))
   handle('vork:favorite-profile', (_, id, value) => profiles.favorite(id, value))
@@ -344,17 +458,36 @@ function registerIpc() {
       onProgress: (progress) => sessions.transferProgress(owner, id, progress),
     })
   })
-  handle('vork:export-result', async (owner, id, result) => {
+  handle('vork:copy-text', async (_, text) => {
+    if (typeof text !== 'string' || Buffer.byteLength(text) > 4 * 1024 * 1024)
+      throw new Error('复制文本无效或超过4 MiB')
+    await clipboard.writeText(text)
+  })
+  handle('vork:copy-result', async (owner, id, result, format, table) => {
     sessions.assertOwned(owner, id)
-    const csv = resultCsv(result)
+    const text =
+      format === 'sql'
+        ? resultInsert(result, table, sessions.getSession(owner, id).type)
+        : resultText(result, format)
+    await clipboard.writeText(text)
+  })
+  handle('vork:export-result', async (owner, id, result, format = 'csv', table) => {
+    sessions.assertOwned(owner, id)
+    const text =
+      format === 'xlsx'
+        ? await resultXlsx(result)
+        : format === 'sql'
+          ? resultInsert(result, table, sessions.getSession(owner, id).type)
+          : resultText(result, format)
+    const extension = format === 'markdown' ? 'md' : format
     const destination = await dialog.showSaveDialog(window!, {
-      title: '导出当前结果（CSV）',
-      defaultPath: 'query-result.csv',
-      filters: [{ name: 'CSV', extensions: ['csv'] }],
+      title: `导出当前结果（${format}）`,
+      defaultPath: `query-result.${extension}`,
+      filters: [{ name: format, extensions: [extension] }],
     })
     if (destination.canceled || !destination.filePath) return null
     sessions.assertOwned(owner, id)
-    await writeFile(destination.filePath, csv, { mode: 0o600 })
+    await writeFile(destination.filePath, text, { mode: 0o600 })
     return destination.filePath
   })
   handle('vork:cancel', (owner, id) => sessions.disconnect(owner, id))
@@ -493,9 +626,17 @@ function createWindow() {
   window.webContents.on('will-navigate', (event) => event.preventDefault())
   const owner = window.webContents.id
   window.webContents.on('did-start-navigation', (_event, _url, inPlace, mainFrame) => {
-    if (mainFrame && !inPlace) void sessions.closeOwner(owner)
+    if (mainFrame && !inPlace) {
+      structures.closeOwner(owner)
+      ai.cancelOwner(owner)
+      void sessions.closeOwner(owner)
+    }
   })
-  window.webContents.on('destroyed', () => void sessions.closeOwner(owner))
+  window.webContents.on('destroyed', () => {
+    structures.closeOwner(owner)
+    ai.cancelOwner(owner)
+    void sessions.closeOwner(owner)
+  })
   window.on('closed', () => {
     window = null
   })

@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { DesktopApi, Reply, SessionEvent } from '../shared/contracts'
+import type { DesktopApi, Reply, SessionEvent, StructureProgress } from '../shared/contracts'
 
 async function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
   const result: Reply<T> = await ipcRenderer.invoke(channel, ...args)
@@ -7,6 +7,23 @@ async function invoke<T>(channel: string, ...args: unknown[]): Promise<T> {
   return result.data
 }
 const api: DesktopApi = {
+  structureSources: () => invoke('vork:structure-sources'),
+  compareStructure: (input) => invoke('vork:structure-compare', input),
+  cancelStructure: (id) => invoke('vork:structure-cancel', id),
+  exportStructure: (id) => invoke('vork:structure-export', id),
+  onStructureProgress(callback) {
+    const listener = (_: Electron.IpcRendererEvent, value: StructureProgress) => callback(value)
+    ipcRenderer.on('vork:structure-progress', listener)
+    return () => ipcRenderer.removeListener('vork:structure-progress', listener)
+  },
+  erRequest: (id, request) => invoke('vork:er-request', id, request),
+  exportErSvg: (id, snapshotId, positions, full) =>
+    invoke('vork:er-export', id, snapshotId, positions, full),
+  queryPlan: (id, sql) => invoke('vork:query-plan', id, sql),
+  aiSettings: () => invoke('vork:ai-settings'),
+  saveAiSettings: (config) => invoke('vork:ai-save-settings', config),
+  aiComplete: (id, request) => invoke('vork:ai-complete', id, request),
+  aiCancel: (id) => invoke('vork:ai-cancel', id),
   onWindowState(callback) {
     const listener = (
       _: Electron.IpcRendererEvent,
@@ -34,6 +51,7 @@ const api: DesktopApi = {
   cancelConnectionImport: () => invoke('vork:import-cancel'),
   updateState: () => invoke('vork:update-state'),
   updateAction: (action) => invoke('vork:update-action', action),
+  schemaRequest: (id, request) => invoke('vork:schema-request', id, request),
   tableRequest: (id, request) => invoke('vork:table-request', id, request),
   reconnectSession: (id) => invoke('vork:reconnect', id),
   favoriteProfile: (id, value) => invoke('vork:favorite-profile', id, value),
@@ -50,7 +68,10 @@ const api: DesktopApi = {
   sshTerminalClose: (id, channelId) => invoke('vork:ssh-terminal-close', id, channelId),
   sshTransferCancel: (id) => invoke('vork:ssh-transfer-cancel', id),
   sshTransfer: (id, kind, path) => invoke('vork:ssh-transfer', id, kind, path),
-  exportResult: (id, result) => invoke('vork:export-result', id, result),
+  exportResult: (id, result, format, table) =>
+    invoke('vork:export-result', id, result, format, table),
+  copyText: (text) => invoke('vork:copy-text', text),
+  copyResult: (id, result, format, table) => invoke('vork:copy-result', id, result, format, table),
   cancel: (id) => invoke('vork:cancel', id),
   write: (id, data, channelId) => ipcRenderer.send('vork:write', id, data, channelId),
   resize: (id, cols, rows, channelId) => ipcRenderer.send('vork:resize', id, cols, rows, channelId),

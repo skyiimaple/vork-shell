@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import AiSettingsForm from './ai-settings-form.vue'
 import { ref } from 'vue'
 import { Button } from '@/components/ui/button'
 import {
@@ -83,6 +84,7 @@ async function project() {
           >
         </div>
       </section>
+      <ai-settings-form v-if="open" />
       <section class="space-y-3 rounded-lg border p-4">
         <h3 class="font-semibold">连接配置</h3>
         <p class="text-muted-foreground text-sm">

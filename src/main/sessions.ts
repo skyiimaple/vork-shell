@@ -1,4 +1,8 @@
 import { runSqlScript, type SqlDialect } from '../shared/sql-script'
+import { readStructureTable } from './structure-compare'
+import { ErDiagramService } from './er-diagram'
+import { explainQuery } from './query-plan'
+import { SchemaTools } from './schema-tools'
 import { TableDataService } from './table-data'
 import { randomUUID } from 'node:crypto'
 import type {
@@ -10,6 +14,10 @@ import type {
   SshRequest,
   SqliteToolRequest,
   TableRequest,
+  SchemaRequest,
+  ErRequest,
+  ErPositions,
+  StructureSource,
   TransferProgress,
 } from '../shared/contracts'
 import { openDatabase, type Adapter } from './adapters'
@@ -18,10 +26,13 @@ import { validateConnection } from './validation'
 
 interface Entry {
   config: ConnectionConfig
+  ephemeral?: boolean
   owner: number
   session: Session
   adapter?: Adapter
   tableData?: TableDataService
+  schemaTools?: SchemaTools
+  er?: ErDiagramService
   ssh?: SshSession
   tunnel?: SshSession
   busy: boolean
@@ -36,7 +47,7 @@ export class SessionManager {
     private verifyHost: (config: ConnectionConfig, fingerprint: string) => Promise<boolean>,
     private resolveSsh?: (id: string) => Promise<ConnectionConfig | undefined>,
   ) {}
-  async connect(owner: number, input: ConnectionConfig) {
+  async connect(owner: number, input: ConnectionConfig, ephemeral = false) {
     const config = validateConnection(input)
     const session: Session = {
       profileId: config.id,
@@ -48,14 +59,16 @@ export class SessionManager {
     }
     const entry: Entry = {
       config: { ...config },
+      ephemeral,
       owner,
       session,
       busy: false,
       queue: Promise.resolve(),
       queued: 0,
     }
-    const emit = (type: SessionEvent['type'], data: string) =>
-      this.emit(owner, { sessionId: session.id, type, data })
+    const emit = (type: SessionEvent['type'], data: string) => {
+      if (!entry.ephemeral) this.emit(owner, { sessionId: session.id, type, data })
+    }
     this.entries.set(session.id, entry)
     try {
       if (config.type === 'ssh') {
@@ -169,6 +182,91 @@ export class SessionManager {
   assertOwned(owner: number, id: string) {
     this.get(owner, id)
   }
+  structureSources(owner: number): StructureSource[] {
+    return [...this.entries]
+      .filter(
+        ([, entry]) =>
+          entry.owner === owner &&
+          !entry.ephemeral &&
+          ['sqlite', 'mysql', 'postgresql'].includes(entry.session.type),
+      )
+      .map(([id, entry]) => ({
+        kind: 'session',
+        id,
+        name: entry.session.name,
+        type: entry.session.type as 'sqlite' | 'mysql' | 'postgresql',
+      }))
+  }
+  async structureTables(
+    owner: number,
+    id: string,
+    schema: string,
+    after: string | undefined,
+    signal: AbortSignal,
+    names?: string[],
+  ) {
+    return this.operation(owner, id, async (adapter) => {
+      const type = this.get(owner, id).session.type
+      if (!['sqlite', 'mysql', 'postgresql'].includes(type)) throw new Error('此连接不支持结构对比')
+      const result = await new ErDiagramService(
+        type as 'sqlite' | 'mysql' | 'postgresql',
+        async (sql, parameters) => {
+          if (signal.aborted) throw new Error('结构对比已取消')
+          return adapter.execute(sql, parameters)
+        },
+      ).request({ kind: 'tables', schema, after, names })
+      if (result.kind !== 'er-tables') throw new Error('表目录读取失败')
+      return result
+    })
+  }
+  async structureTable(
+    owner: number,
+    id: string,
+    table: { schema: string; name: string },
+    signal: AbortSignal,
+  ) {
+    return this.operation(owner, id, (adapter) => {
+      const type = this.get(owner, id).session.type
+      if (!['sqlite', 'mysql', 'postgresql'].includes(type)) throw new Error('此连接不支持结构对比')
+      return readStructureTable(
+        type as 'sqlite' | 'mysql' | 'postgresql',
+        table,
+        async (sql, parameters) => {
+          if (signal.aborted) throw new Error('结构对比已取消')
+          return adapter.execute(sql, parameters)
+        },
+      )
+    })
+  }
+  async erRequest(owner: number, id: string, request: ErRequest) {
+    const entry = this.get(owner, id)
+    if (!['sqlite', 'mysql', 'postgresql'].includes(entry.session.type))
+      throw new Error('此连接不支持 ER 关系图')
+    return this.operation(owner, id, (adapter) => {
+      entry.er ??= new ErDiagramService(
+        entry.session.type as 'sqlite' | 'mysql' | 'postgresql',
+        (sql, parameters) => adapter.execute(sql, parameters),
+      )
+      return entry.er.request(request)
+    })
+  }
+  erSvg(owner: number, id: string, snapshotId: string, positions: ErPositions, full: boolean) {
+    const entry = this.get(owner, id)
+    if (!entry.er) throw new Error('请先读取关系图')
+    return entry.er.svg(snapshotId, positions, full)
+  }
+  async schemaRequest(owner: number, id: string, request: SchemaRequest) {
+    const entry = this.get(owner, id)
+    if (!['sqlite', 'mysql', 'postgresql'].includes(entry.session.type))
+      throw new Error('此连接不支持结构工具')
+    return this.operation(owner, id, (adapter) => {
+      entry.schemaTools ??= new SchemaTools(
+        entry.session.type as 'sqlite' | 'mysql' | 'postgresql',
+        (sql, parameters) => adapter.execute(sql, parameters),
+      )
+      return entry.schemaTools.request(request)
+    })
+  }
   async tableRequest(owner: number, id: string, request: TableRequest) {
     const entry = this.get(owner, id)
     if (!['sqlite', 'mysql', 'postgresql'].includes(entry.session.type))
@@ -180,6 +278,13 @@ export class SessionManager {
       )
       return entry.tableData.request(request)
     })
+  }
+  async queryPlan(owner: number, id: string, sql: string) {
+    const type = this.get(owner, id).session.type
+    if (!['sqlite', 'mysql', 'postgresql'].includes(type)) throw new Error('此连接不支持执行计划')
+    return this.operation(owner, id, (adapter) =>
+      explainQuery(type as SqlDialect, sql, (statement) => adapter.execute(statement)),
+    )
   }
   async executeScript(owner: number, id: string, sql: string) {
     const type = this.get(owner, id).session.type
@@ -244,9 +349,9 @@ export class SessionManager {
   async disconnect(owner: number, id: string) {
     const entry = this.get(owner, id)
     this.entries.delete(id)
-    this.recent.set(id, { owner: entry.owner, config: { ...entry.config } })
+    if (!entry.ephemeral) this.recent.set(id, { owner: entry.owner, config: { ...entry.config } })
     while (this.recent.size > 32) this.recent.delete(this.recent.keys().next().value!)
-    this.emit(owner, { sessionId: id, type: 'closed', data: '连接已断开' })
+    if (!entry.ephemeral) this.emit(owner, { sessionId: id, type: 'closed', data: '连接已断开' })
     await Promise.allSettled([entry.ssh?.close(), entry.adapter?.close(), entry.tunnel?.close()])
   }
   write(owner: number, id: string, data: string, channelId?: string) {

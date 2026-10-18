@@ -2,7 +2,7 @@
 import { TreeRow } from '@/components/ui/tree'
 import { computed, ref, onBeforeUnmount, onMounted, watch } from 'vue'
 import { useMutation } from '@tanstack/vue-query'
-import { Folder, Database, RefreshCw, Table2, Eye, List } from '@lucide/vue'
+import { Folder, Database, RefreshCw, Table2, Eye, List, ListTree } from '@lucide/vue'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -36,6 +36,7 @@ const emit = defineEmits<{
   busy: [value: boolean]
   completion: [tables: SqlCompletionTable[]]
   browse: [object: SqlObject]
+  schema: [object: SqlObject]
   structure: [result: QueryResult]
 }>()
 const objects = ref<SqlObject[]>([]),
@@ -73,9 +74,9 @@ function toggleSchema(name: string) {
     : [...collapsedSchemas.value, name]
 }
 watch(
-  () => props.database,
-  (value) => {
-    if (value) load()
+  () => [props.database, props.executing] as const,
+  ([value, executing], [previous]) => {
+    if (value && !executing && (value !== previous || !loaded.value)) load()
   },
   { immediate: false },
 )
@@ -285,6 +286,15 @@ onBeforeUnmount(() => {
                         variant="ghost"
                         size="icon"
                         class="size-7 shrink-0"
+                        :aria-label="`查看结构 ${object.schema}.${object.name}`"
+                        :disabled="blocked"
+                        @click="emit('schema', object)"
+                        ><list-tree :size="12"
+                      /></Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        class="size-7 shrink-0"
                         :aria-label="`管理数据 ${object.schema}.${object.name}`"
                         :disabled="blocked"
                         @click="emit('browse', object)"
@@ -301,6 +311,9 @@ onBeforeUnmount(() => {
                     ></template> </tree-row
                 ></context-menu-trigger>
                 <context-menu-content>
+                  <context-menu-item :disabled="blocked" @select="emit('schema', object)"
+                    >管理结构（索引、外键、触发器）</context-menu-item
+                  >
                   <context-menu-item :disabled="blocked" @select="emit('browse', object)"
                     >管理数据（分页与编辑）</context-menu-item
                   >

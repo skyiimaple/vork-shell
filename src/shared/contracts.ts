@@ -116,6 +116,23 @@ export interface ActivityEntry {
   message: string
 }
 export interface DesktopApi {
+  structureSources(): Promise<StructureSource[]>
+  compareStructure(input: StructureCompareRequest): Promise<StructureReport>
+  cancelStructure(id: string): Promise<boolean>
+  exportStructure(id: string): Promise<string | null>
+  onStructureProgress(callback: (progress: StructureProgress) => void): () => void
+  erRequest(id: string, request: ErRequest): Promise<ErResponse>
+  exportErSvg(
+    id: string,
+    snapshotId: string,
+    positions: ErPositions,
+    full: boolean,
+  ): Promise<string | null>
+  queryPlan(id: string, sql: string): Promise<QueryPlan>
+  aiSettings(): Promise<AiSettingsView>
+  saveAiSettings(config: AiSettings & { apiKey?: string }): Promise<AiSettingsView>
+  aiComplete(sessionId: string, request: AiRequest): Promise<AiResponse>
+  aiCancel(requestId: string): Promise<boolean>
   onWindowState(callback: (state: { fullscreen: boolean; platform: string }) => void): () => void
   createQuerySession(id: string, database?: string): Promise<Session>
   setConnectionColor(id: string, color: string): Promise<void>
@@ -137,6 +154,7 @@ export interface DesktopApi {
   cancelConnectionImport(): Promise<void>
   updateState(): Promise<UpdateState>
   updateAction(action: UpdateAction): Promise<UpdateState>
+  schemaRequest(id: string, request: SchemaRequest): Promise<SchemaResponse>
   tableRequest(id: string, request: TableRequest): Promise<TableResponse>
   connect(config: ConnectionConfig): Promise<Session>
   reconnectSession(id: string): Promise<Session>
@@ -161,7 +179,19 @@ export interface DesktopApi {
     kind: 'upload' | 'download',
     remotePath: string,
   ): Promise<SshTransferResult>
-  exportResult(id: string, result: QueryResult): Promise<string | null>
+  exportResult(
+    id: string,
+    result: QueryResult,
+    format?: 'csv' | 'json' | 'markdown' | 'sql' | 'xlsx',
+    table?: string,
+  ): Promise<string | null>
+  copyText(text: string): Promise<void>
+  copyResult(
+    id: string,
+    result: QueryResult,
+    format: 'tsv' | 'csv' | 'json' | 'markdown' | 'sql',
+    table?: string,
+  ): Promise<void>
   cancel(id: string): Promise<void>
   write(id: string, data: string, channelId?: string): void
   resize(id: string, cols: number, rows: number, channelId?: string): void
@@ -313,6 +343,23 @@ export interface DataColumn {
   primaryKey: number
   editable: boolean
 }
+export interface TableFilter {
+  column: string
+  operator:
+    | 'eq'
+    | 'ne'
+    | 'gt'
+    | 'gte'
+    | 'lt'
+    | 'lte'
+    | 'contains'
+    | 'not-contains'
+    | 'starts-with'
+    | 'ends-with'
+    | 'is-null'
+    | 'not-null'
+  value?: Cell
+}
 export type TableRequest =
   | {
       kind: 'browse'
@@ -320,12 +367,21 @@ export type TableRequest =
       page: number
       pageSize: number
       sort?: { column: string; descending: boolean }
-      filter?: {
-        column: string
-        operator: 'eq' | 'contains' | 'is-null' | 'not-null'
-        value?: string
-      }
+      filter?: TableFilter
+      filters?: TableFilter[]
+      match?: 'all' | 'any'
     }
+  | { kind: 'preview-insert'; table: DataTable; values: { column: string; value: Cell }[] }
+  | { kind: 'preview-delete'; snapshotId: string; rowIndex: number }
+  | { kind: 'preview-delete-many'; snapshotId: string; rowIndices: number[] }
+  | {
+      kind: 'preview-update-many'
+      snapshotId: string
+      rowIndices: number[]
+      column: string
+      value: Cell
+    }
+  | { kind: 'commit'; token: string }
   | { kind: 'edit'; snapshotId: string; rowIndex: number; column: string; value: Cell }
 export interface TablePage {
   kind: 'page'
@@ -336,8 +392,21 @@ export interface TablePage {
   hasNext: boolean
   snapshotId?: string
   readOnlyReason?: string
+  insertColumns?: string[]
+  canDelete?: boolean
+  canBatchUpdate?: boolean
 }
-export type TableResponse = TablePage | { kind: 'edited'; affectedRows: number }
+export interface TableMutationPreview {
+  kind: 'mutation-preview'
+  token: string
+  sql: string
+  parameters: Cell[]
+  requestedRows?: number
+}
+export type TableResponse =
+  | TablePage
+  | TableMutationPreview
+  | { kind: 'edited'; affectedRows: number; requestedRows?: number }
 
 export type MongoRequest =
   | { kind: 'databases' }
@@ -377,3 +446,209 @@ export type MongoResponse =
   | { kind: 'indexes'; documents: string[]; truncated: boolean }
   | MongoDocuments
   | { kind: 'mutation'; affected: number }
+
+export interface SchemaIndex {
+  method?: string
+  predicate?: string | null
+  included?: string[]
+  name: string
+  unique: boolean
+  protected: boolean
+  columns: string[]
+  definition: string
+}
+export interface SchemaInfo {
+  kind: 'schema'
+  columnInfo: QueryResult
+  objectKind: string
+  objectDefinition: string
+  checks: QueryResult
+  canCreateIndex: boolean
+  columns: string[]
+  indexes: SchemaIndex[]
+  foreignKeys: QueryResult
+  triggers: QueryResult
+}
+export type ColumnDefault =
+  | { kind: 'value'; value: Cell }
+  | { kind: 'expression'; expression: 'CURRENT_TIMESTAMP' | 'CURRENT_DATE' | 'CURRENT_TIME' }
+export type ForeignKeyRule = 'NO ACTION' | 'RESTRICT' | 'CASCADE' | 'SET NULL' | 'SET DEFAULT'
+export interface SchemaForeignKey extends ErRelation {
+  key: string
+  definition: string
+  droppable: boolean
+}
+export type SchemaRequest =
+  | { kind: 'inspect'; table: DataTable }
+  | { kind: 'foreign-keys'; table: DataTable }
+  | {
+      kind: 'preview-create-foreign-key'
+      table: DataTable
+      name: string
+      columns: string[]
+      reference: DataTable
+      referenceColumns: string[]
+      onUpdate: ForeignKeyRule
+      onDelete: ForeignKeyRule
+    }
+  | { kind: 'preview-drop-foreign-key'; table: DataTable; key: string }
+  | {
+      kind: 'preview-create-index'
+      table: DataTable
+      name: string
+      columns: { name: string; descending: boolean }[]
+      unique: boolean
+    }
+  | { kind: 'preview-drop-index'; table: DataTable; name: string }
+  | {
+      kind: 'preview-add-column'
+      table: DataTable
+      name: string
+      type: string
+      nullable: boolean
+      default?: ColumnDefault
+    }
+  | { kind: 'preview-rename-column'; table: DataTable; column: string; name: string }
+  | { kind: 'preview-drop-column'; table: DataTable; name: string }
+  | { kind: 'preview-column-default'; table: DataTable; name: string; default?: ColumnDefault }
+  | { kind: 'preview-column-type'; table: DataTable; name: string; type: string; convert: boolean }
+  | { kind: 'preview-column-nullable'; table: DataTable; name: string; nullable: boolean }
+  | { kind: 'commit'; token: string }
+export type SchemaResponse =
+  | SchemaInfo
+  | { kind: 'foreign-keys'; keys: SchemaForeignKey[] }
+  | { kind: 'schema-preview'; token: string; sql: string }
+  | { kind: 'schema-applied' }
+
+export interface AiSettings {
+  provider: 'openai' | 'openai-compatible' | 'anthropic'
+  baseUrl: string
+  model: string
+  maxTokens?: number
+}
+export interface AiSettingsView extends AiSettings {
+  hasApiKey: boolean
+}
+export interface AiRequest {
+  id: string
+  action: 'generate' | 'explain' | 'optimize' | 'fix'
+  prompt: string
+  sql: string
+  error?: string
+  context?: string
+  history?: { role: 'user' | 'assistant'; content: string }[]
+}
+export interface AiResponse {
+  text: string
+  sql?: string
+  truncated: boolean
+}
+
+export interface PlanNode {
+  id: string
+  label: string
+  details: Record<string, string>
+  children: PlanNode[]
+}
+export interface QueryPlan {
+  dialect: 'sqlite' | 'mysql' | 'postgresql'
+  sql: string
+  nodes: PlanNode[]
+  raw: QueryResult
+  warnings: string[]
+}
+
+export interface ErColumn {
+  name: string
+  type: string
+  primaryKey: boolean
+  nullable: boolean
+}
+export interface ErEntity {
+  table: DataTable
+  columns: ErColumn[]
+}
+export interface ErRelation {
+  id: string
+  name: string
+  from: DataTable
+  to: DataTable
+  fromColumns: string[]
+  toColumns: string[]
+  onUpdate: string
+  onDelete: string
+}
+export interface ErDiagram {
+  kind: 'er-diagram'
+  snapshotId: string
+  tables: ErEntity[]
+  relations: ErRelation[]
+  warnings: string[]
+}
+export type ErPositions = Record<string, { x: number; y: number }>
+export type ErRequest =
+  | { kind: 'tables'; schema: string; search?: string; after?: string; names?: string[] }
+  | { kind: 'diagram'; tables: DataTable[] }
+export type ErResponse = ErDiagram | { kind: 'er-tables'; tables: string[]; after?: string }
+
+export type StructureRef = { kind: 'session' | 'profile'; id: string }
+export interface StructureSource extends StructureRef {
+  name: string
+  type: 'sqlite' | 'mysql' | 'postgresql'
+}
+export interface StructureColumn {
+  name: string
+  type: string
+  nullable: boolean
+  defaultValue: Cell
+  position: number
+  primaryKey: boolean
+  extra: string
+  collation: string | null
+  generated: string | null
+  comment: string
+}
+export interface StructureTable {
+  table: DataTable
+  kind: string
+  columns: StructureColumn[]
+  indexes: SchemaIndex[]
+  foreignKeys: ErRelation[]
+  triggers: QueryResult
+  checks: QueryResult
+  definition: string
+}
+export interface StructureDifference {
+  table: string
+  kind: 'object' | 'column' | 'index' | 'foreign-key' | 'trigger' | 'check' | 'definition'
+  name: string
+  change: 'source-only' | 'target-only' | 'changed'
+  source?: unknown
+  target?: unknown
+}
+export interface StructureCompareRequest {
+  id: string
+  source: StructureRef
+  target: StructureRef
+  sourceSchema: string
+  targetSchema: string
+  tables?: string[]
+}
+export interface StructureReport {
+  requestedTables: string[]
+  id: string
+  createdAt: string
+  source: StructureSource & { schema: string }
+  target: StructureSource & { schema: string }
+  sourceTables: number
+  targetTables: number
+  differences: StructureDifference[]
+  warnings: string[]
+}
+export interface StructureProgress {
+  id: string
+  side: 'source' | 'target'
+  completed: number
+  total: number
+  table: string
+}
