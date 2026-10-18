@@ -1,5 +1,5 @@
 const { app, BrowserWindow } = require('electron')
-const { createServer } = require('node:http')
+const http = require('node:http')
 const { mkdtempSync, rmSync } = require('node:fs')
 const { join } = require('node:path'),
   { tmpdir } = require('node:os')
@@ -8,24 +8,66 @@ const directory = mkdtempSync(join(tmpdir(), 'vork-ai-ui-'))
 app.setPath('userData', directory)
 require('./smoke-window.cjs')
 const requests = []
-const server = createServer(async (req, res) => {
+let releaseStream = () => {}
+const streamGate = new Promise((resolve) => {
+  releaseStream = resolve
+})
+const upstream = http.createServer(async (req, res) => {
   let text = ''
   for await (const chunk of req) text += chunk
-  const body = JSON.parse(text)
-  requests.push(body)
-  res.setHeader('content-type', 'application/json')
-  res.end(
-    JSON.stringify({
+  requests.push({ body: JSON.parse(text), proxy: req.headers['x-test-proxy'] || '' })
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' })
+  res.write(
+    `data: ${JSON.stringify({ choices: [{ delta: { content: 'STREAMING_PARTIAL\n' } }] })}\n\n`,
+  )
+  await streamGate
+  res.write(
+    `data: ${JSON.stringify({
       choices: [
         {
-          message: {
+          delta: {
             content: '以下 SQL 需审查：\n```sql\nCREATE TABLE ai_should_not_run(id INTEGER);\n```',
           },
           finish_reason: 'stop',
         },
       ],
-    }),
+    })}\n\n`,
   )
+  res.write('data: [DONE]\n\n')
+  res.end()
+})
+let proxyHits = 0
+const proxy = http.createServer((req, res) => {
+  proxyHits += 1
+  let target
+  try {
+    target = new URL(req.url || '')
+  } catch {
+    res.writeHead(400)
+    res.end()
+    return
+  }
+  const headers = { ...req.headers, host: target.host, 'x-test-proxy': '1' }
+  delete headers['proxy-authorization']
+  delete headers['proxy-connection']
+  const forwarded = http.request(
+    {
+      hostname: target.hostname,
+      port: target.port,
+      path: `${target.pathname}${target.search}`,
+      method: req.method,
+      headers,
+    },
+    (up) => {
+      res.writeHead(up.statusCode || 502, up.headers)
+      up.pipe(res)
+    },
+  )
+  forwarded.on('error', () => {
+    if (!res.headersSent) res.writeHead(502)
+    res.end()
+  })
+  req.pipe(forwarded)
 })
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 async function wait(w, code) {
@@ -46,10 +88,18 @@ async function input(w, label, value) {
   )
   await pause(50)
 }
-const timer = setTimeout(() => app.exit(1), 30000)
+async function closeServers() {
+  releaseStream()
+  upstream.closeAllConnections()
+  proxy.closeAllConnections()
+  await new Promise((resolve) => upstream.close(resolve))
+  await new Promise((resolve) => proxy.close(resolve))
+}
+const timer = setTimeout(() => app.exit(1), 45000)
 ;(async () => {
   try {
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+    await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+    await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve))
     await import('../out/main/index.js')
     await app.whenReady()
     const w = BrowserWindow.getAllWindows()[0]
@@ -61,8 +111,9 @@ const timer = setTimeout(() => app.exit(1), 30000)
       `document.querySelector('[aria-label="AI SQL 助手"]').click()`,
     )
     await wait(w, `Boolean(document.querySelector('[aria-label="AI 模型名称"]'))`)
-    await input(w, 'AI 服务地址', 'http://127.0.0.1:' + server.address().port + '/v1')
+    await input(w, 'AI 服务地址', 'http://127.0.0.1:' + upstream.address().port + '/v1')
     await input(w, 'AI 模型名称', 'local-fixture')
+    await input(w, 'AI 代理地址', 'http://127.0.0.1:' + proxy.address().port)
     await button(w, '保存 AI 配置')
     await wait(
       w,
@@ -70,11 +121,22 @@ const timer = setTimeout(() => app.exit(1), 30000)
     )
     await input(w, 'AI 需求', '生成一个建表语句，等待我审查')
     await button(w, '发送给 AI')
+    await wait(w, `document.body.textContent.includes('STREAMING_PARTIAL')`)
+    assert.equal(
+      await w.webContents.executeJavaScript(
+        `Boolean(document.querySelector('[aria-label="AI SQL 建议"]'))`,
+      ),
+      false,
+    )
+    releaseStream()
     await wait(w, `Boolean(document.querySelector('[aria-label="AI SQL 建议"]'))`)
     assert.equal(requests.length, 1)
-    assert.equal(requests[0].model, 'local-fixture')
-    assert.equal(JSON.stringify(requests[0]).includes('password'), false)
-    assert.equal(requests[0].max_tokens, 4096)
+    assert.equal(requests[0].body.model, 'local-fixture')
+    assert.equal(requests[0].body.stream, true)
+    assert.equal(requests[0].body.max_tokens, 4096)
+    assert.equal(requests[0].proxy, '1')
+    assert.equal(proxyHits, 1)
+    assert.equal(JSON.stringify(requests[0].body).includes('password'), false)
     await button(w, '替换编辑器内容')
     await wait(
       w,
@@ -113,13 +175,15 @@ const timer = setTimeout(() => app.exit(1), 30000)
     assert.equal(exists, 1)
     const settings = await w.webContents.executeJavaScript('window.vork.aiSettings()')
     assert.equal(settings.model, 'local-fixture')
+    assert.equal(settings.proxyUrl, 'http://127.0.0.1:' + proxy.address().port)
+    assert.equal(settings.hasProxyPassword, false)
+    assert.equal(JSON.stringify(settings).includes('proxy-secret'), false)
     console.log(
-      'AI SQL UI: saved local provider, HTTP request, review and editor replacement passed; SQL runs only after explicit execution confirmation',
+      'AI SQL UI: streamed local provider through HTTP proxy, review and editor replacement passed; SQL runs only after explicit execution confirmation',
     )
     clearTimeout(timer)
     w.destroy()
-    server.closeAllConnections()
-    await new Promise((resolve) => server.close(resolve))
+    await closeServers()
     rmSync(directory, { recursive: true, force: true })
     app.exit(0)
   } catch (e) {
@@ -128,8 +192,7 @@ const timer = setTimeout(() => app.exit(1), 30000)
     if (w)
       console.error(await w.webContents.executeJavaScript('document.body.innerText.slice(-4000)'))
     clearTimeout(timer)
-    server.closeAllConnections()
-    server.close()
+    await closeServers().catch(() => {})
     app.exit(1)
   }
 })()

@@ -40,6 +40,7 @@ const action = ref<AiRequest['action']>('generate'),
   busy = ref(false),
   error = ref(''),
   response = ref<AiResponse>(),
+  streamText = ref(''),
   sqlOutput = ref(''),
   requestId = ref(''),
   followUp = ref(false)
@@ -52,6 +53,15 @@ const canSend = computed(
     Boolean(prompt.value.trim() || sqlInput.value.trim()),
 )
 let mounted = true
+const stopProgress = window.vork.onAiProgress((progress) => {
+  if (
+    progress?.id === requestId.value &&
+    typeof progress.text === 'string' &&
+    !response.value &&
+    open.value
+  )
+    streamText.value = progress.text
+})
 watch(open, async (value) => {
   if (value) {
     sqlInput.value = props.sql
@@ -72,6 +82,7 @@ async function send() {
   busy.value = true
   error.value = ''
   response.value = undefined
+  streamText.value = ''
   sqlOutput.value = ''
   try {
     const result = await window.vork.aiComplete(props.session.id, {
@@ -85,6 +96,7 @@ async function send() {
     })
     if (!mounted || !open.value) return
     response.value = result
+    streamText.value = ''
     sqlOutput.value = result.sql || ''
     history.value = [
       ...(followUp.value ? history.value : []),
@@ -92,7 +104,10 @@ async function send() {
       { role: 'assistant' as const, content: result.text },
     ].slice(-20)
   } catch (e) {
-    if (mounted && open.value) error.value = (e as Error).message
+    if (mounted && open.value) {
+      error.value = (e as Error).message
+      streamText.value = ''
+    }
   } finally {
     if (mounted && requestId.value === id) {
       busy.value = false
@@ -129,12 +144,14 @@ function apply() {
 function clear() {
   history.value = []
   response.value = undefined
+  streamText.value = ''
   sqlOutput.value = ''
   followUp.value = false
   error.value = ''
 }
 onBeforeUnmount(() => {
   mounted = false
+  stopProgress()
   if (requestId.value) void window.vork.aiCancel(requestId.value).catch(() => {})
 })
 </script>
@@ -145,7 +162,7 @@ onBeforeUnmount(() => {
         ><dialog-title>AI SQL 助手</dialog-title
         ><dialog-description
           >{{ session.type.toUpperCase() }} ·
-          内容发送至你配置的模型服务。生成结果需审查，不会自动执行。</dialog-description
+          内容发送至你配置的模型服务。回答逐步显示，生成结果需审查，不会自动执行。</dialog-description
         ></dialog-header
       >
       <div class="min-h-0 space-y-4 overflow-auto">
@@ -218,15 +235,18 @@ onBeforeUnmount(() => {
         <alert v-if="error" variant="destructive"
           ><alert-description>{{ error }}</alert-description></alert
         >
-        <template v-if="response"
-          ><p v-if="response.truncated" class="text-destructive text-sm">
+        <template v-if="response || streamText"
+          ><p v-if="response?.truncated" class="text-destructive text-sm">
             模型输出达到上限，请增加上限或缩小问题；当前内容可能不完整。
+          </p>
+          <p v-if="busy && !response" class="text-muted-foreground text-sm">
+            正在接收模型输出，完成后才能填入 SQL。
           </p>
           <pre
             aria-label="AI 回答"
             class="max-h-72 overflow-auto rounded-md border p-4 text-sm break-all whitespace-pre-wrap"
-            >{{ response.text }}</pre>
-          <Label v-if="sqlOutput" class="grid gap-2"
+            >{{ response?.text || streamText }}</pre>
+          <Label v-if="sqlOutput && response" class="grid gap-2"
             ><span>待填入的 SQL（可编辑）</span
             ><Textarea
               v-model="sqlOutput"
@@ -234,9 +254,12 @@ onBeforeUnmount(() => {
               class="min-h-32 font-mono text-xs"
           /></Label>
           <div class="flex gap-2">
-            <Button v-if="sqlOutput" :disabled="busy || response.truncated" @click="apply"
+            <Button
+              v-if="sqlOutput && response"
+              :disabled="busy || response.truncated"
+              @click="apply"
               >替换编辑器内容</Button
-            ><Button variant="outline" @click="copy">复制回答</Button>
+            ><Button variant="outline" :disabled="!response" @click="copy">复制回答</Button>
           </div></template
         >
       </div>
